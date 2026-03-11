@@ -31,7 +31,7 @@ class FineFacePipeline:
     def __init__(self, cache_dir: str = None):
         self.cache_dir = cache_dir
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        sd_repo_id = "stabilityai/stable-diffusion-2-1-base"
+        sd_repo_id = "Manojb/stable-diffusion-2-1-base"
         fineface_repo_id = "Tvaranka/fineface"
         AUS = [1, 2, 4, 5, 6, 9, 12, 15, 17, 20, 25, 26]
         self.AU_DICT = {f"AU{au}": 0 for au in AUS}

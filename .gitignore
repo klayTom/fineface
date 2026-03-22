@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Model checkpoints (usually large)
+*/checkpoint-*/
+checkpoints/
+models/
+
+# Weights & Biases logs
+wandb/
+
+# Temporary evaluation outputs
+eval_tmp/
+results/
+
+# IDE / editor files
+.vscode/
+.idea/
+/bin/bash: line 1: wq: command not found
+*~
+
+# OS files
+.DS_Store
+/bin/bash: line 1: q: command not found

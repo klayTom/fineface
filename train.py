@@ -58,7 +58,7 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from tensordict.tensordict import TensorDict
 from io import BytesIO
-from fineface.au_datasets import get_disfa, get_affectnet
+from fineface.au_dataset import load_disfa, load_affectnet
 from fineface.au_attention import hack_unet_attn_layers, AUAttnProcessor
 from fineface.fineface_pipeline import AUEncoder
 
@@ -586,7 +586,7 @@ def main():
     )
 
     unet.set_default_attn_processor()
-    hack_unet_attn_layers(unet)
+    hack_unet_attn_layers(unet, AUAttnProcessor)
 
     # Init au_adapter weights with copies of cross-attention
     attn2_modules = [module for name, module in unet.named_modules() if "attn2" in name and "attn2." not in name]
@@ -679,9 +679,9 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    disfa_dataset = get_disfa(args.disfa_image_path, args.disfa_label_path, args.disfa_captions_file)
+    disfa_dataset = load_disfa(args.disfa_image_path, args.disfa_label_path, args.disfa_captions_file)
 
-    an_dataset = get_affectnet(args.affectnet_rar_file, args.affectnet_csv_path)
+    an_dataset = load_affectnet(args.affectnet_rar_file, args.affectnet_csv_path)
 
     train_dataset = concatenate_datasets([an_dataset, disfa_dataset])
     # Overwrite image feature

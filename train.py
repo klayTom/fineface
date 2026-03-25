@@ -61,6 +61,7 @@ from io import BytesIO
 from fineface.au_dataset import load_disfa, load_affectnet
 from fineface.au_attention import hack_unet_attn_layers, AUAttnProcessor
 from fineface.fineface_pipeline import AUEncoder
+from facenet_pytorch import InceptionResnetV1
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -524,6 +525,437 @@ def parse_args():
 
 
 
+# def main():
+    # args = parse_args()
+    # logging_dir = Path(args.output_dir, args.logging_dir)
+
+    # accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+
+    # accelerator = Accelerator(
+    #     gradient_accumulation_steps=args.gradient_accumulation_steps,
+    #     mixed_precision=args.mixed_precision,
+    #     log_with=args.report_to,
+    #     project_config=accelerator_project_config,
+    # )
+    # if args.report_to == "wandb":
+    #     if not is_wandb_available():
+    #         raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+    #     import wandb
+
+    # # Make one log on every process with the configuration for debugging.
+    # logging.basicConfig(
+    #     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    #     datefmt="%m/%d/%Y %H:%M:%S",
+    #     level=logging.INFO,
+    # )
+    # logger.info(accelerator.state, main_process_only=False)
+    # if accelerator.is_local_main_process:
+    #     datasets.utils.logging.set_verbosity_warning()
+    #     transformers.utils.logging.set_verbosity_warning()
+    #     diffusers.utils.logging.set_verbosity_info()
+    # else:
+    #     datasets.utils.logging.set_verbosity_error()
+    #     transformers.utils.logging.set_verbosity_error()
+    #     diffusers.utils.logging.set_verbosity_error()
+
+    # # If passed along, set the training seed now.
+    # if args.seed is not None:
+    #     set_seed(args.seed)
+
+    # # Handle the repository creation
+    # if accelerator.is_main_process:
+    #     if args.output_dir is not None:
+    #         os.makedirs(args.output_dir, exist_ok=True)
+
+    #     if args.push_to_hub:
+    #         repo_id = create_repo(
+    #             repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+    #         ).repo_id
+    # # Load scheduler, tokenizer and models.
+    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    # tokenizer = CLIPTokenizer.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+    # )
+    # text_encoder = CLIPTextModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+    # )
+    # vae = AutoencoderKL.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+    # )
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    # )
+
+    # unet.set_default_attn_processor()
+    # hack_unet_attn_layers(unet, AUAttnProcessor)
+
+    # # Init au_adapter weights with copies of cross-attention
+    # attn2_modules = [module for name, module in unet.named_modules() if "attn2" in name and "attn2." not in name]
+    # for attn_module in attn2_modules:
+    #     attn_module.processor.au_to_k = deepcopy(attn_module.to_k)
+    #     attn_module.processor.au_to_v = deepcopy(attn_module.to_v)
+    # # freeze parameters of models to save more memory
+    # unet.requires_grad_(False)
+    # vae.requires_grad_(False)
+    # text_encoder.requires_grad_(False)
+
+    # # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # # as these weights are only used for inference, keeping weights in full precision is not required.
+    # weight_dtype = torch.float32
+    # if accelerator.mixed_precision == "fp16":
+    #     weight_dtype = torch.float16
+    # elif accelerator.mixed_precision == "bf16":
+    #     weight_dtype = torch.bfloat16
+
+    # # Freeze the unet parameters before adding adapters
+    # for param in unet.parameters():
+    #     param.requires_grad_(False)
+
+    # unet_lora_config = LoraConfig(
+    #    r=args.rank, init_lora_weights="gaussian", target_modules=["to_k", "to_q", "to_v", "to_out.0"]
+    # )
+
+    # # Move unet, vae and text_encoder to device and cast to weight_dtype
+    # unet.to(accelerator.device, dtype=weight_dtype)
+    # vae.to(accelerator.device, dtype=weight_dtype)
+    # text_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    # # Add adapter and make sure the trainable params are in float32.
+    # unet.add_adapter(unet_lora_config, adapter_name="unet")
+    # [attn_module.requires_grad_(True) for attn_module in unet.attn_processors.values() if isinstance(attn_module, AUAttnProcessor)]
+    # if args.mixed_precision == "fp16":
+    #     for param in unet.parameters():
+    #         # only upcast trainable parameters (LoRA) into fp32
+    #         if param.requires_grad:
+    #             param.data = param.to(torch.float32)
+
+    # if args.enable_xformers_memory_efficient_attention:
+    #     if is_xformers_available():
+    #         import xformers
+
+    #         xformers_version = version.parse(xformers.__version__)
+    #         if xformers_version == version.parse("0.0.16"):
+    #             logger.warn(
+    #                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+    #             )
+    #         unet.enable_xformers_memory_efficient_attention()
+    #     else:
+    #         raise ValueError("xformers is not available. Make sure it is installed correctly")
+        
+    # au_encoder = AUEncoder().cuda().requires_grad_(True)
+    # au_encoder.train()
+    
+    # from itertools import chain
+
+    # lora_layers = filter(lambda p: p.requires_grad, chain(unet.parameters(), au_encoder.parameters()))
+
+    # # Enable TF32 for faster training on Ampere GPUs,
+    # # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    # if args.allow_tf32:
+    #     torch.backends.cuda.matmul.allow_tf32 = True
+
+    # if args.scale_lr:
+    #     args.learning_rate = (
+    #         args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+    #     )
+
+    # # Initialize the optimizer
+    # if args.use_8bit_adam:
+    #     try:
+    #         import bitsandbytes as bnb
+    #     except ImportError:
+    #         raise ImportError(
+    #             "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+    #         )
+
+    #     optimizer_cls = bnb.optim.AdamW8bit
+    # else:
+    #     optimizer_cls = torch.optim.AdamW
+
+    # optimizer = optimizer_cls(
+    #     lora_layers,
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
+
+    # disfa_dataset = load_disfa(args.disfa_image_path, args.disfa_label_path, args.disfa_captions_file)
+
+    # an_dataset = load_affectnet(args.affectnet_rar_file, args.affectnet_csv_path)
+
+    # train_dataset = concatenate_datasets([an_dataset, disfa_dataset])
+    # # Overwrite image feature
+    # train_dataset.info.features["image"] = an_dataset.features["image"]
+
+    # with accelerator.main_process_first():
+    #     if args.max_train_samples is not None:
+    #         train_dataset = train_dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
+    #     # Set the training transforms
+    #     #train_dataset = train_dataset.with_transform(preprocess_train)
+
+    
+    # def collate_fn(examples):
+    #     # Images to pixels
+    #     pixel_values = torch.stack([example["pixel_values"] for example in examples])
+    #     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    #     # Get AUs
+    #     aus = torch.stack([example["aus"] for example in examples])
+    #     caption = [example["caption"] for example in examples]
+    #     tokens = torch.stack([tokenize_prompt(tokenizer, example["caption"]) for example in examples])
+    #     return {"pixel_values": pixel_values, "aus": aus, "caption": caption, "tokens": tokens}
+
+    # # DataLoaders creation:
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     shuffle=True,
+    #     collate_fn=collate_fn,
+    #     batch_size=args.train_batch_size,
+    #     num_workers=args.dataloader_num_workers,
+    # )
+
+    # # Scheduler and math around the number of training steps.
+    # overrode_max_train_steps = False
+    # num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    # if args.max_train_steps is None:
+    #     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    #     overrode_max_train_steps = True
+
+    # lr_scheduler = get_scheduler(
+    #     args.lr_scheduler,
+    #     optimizer=optimizer,
+    #     num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+    #     num_training_steps=args.max_train_steps * accelerator.num_processes,
+    # )
+
+    # # Prepare everything with our `accelerator`.
+    # unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    #     unet, optimizer, train_dataloader, lr_scheduler
+    # )
+
+    # # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    # num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    # if overrode_max_train_steps:
+    #     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # # Afterwards we recalculate our number of training epochs
+    # args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # # We need to initialize the trackers we use, and also store our configuration.
+    # # The trackers initializes automatically on the main process.
+    # if accelerator.is_main_process:
+    #     accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+
+    # # Train!
+    # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    # logger.info("***** Running training *****")
+    # logger.info(f"  Num examples = {len(train_dataset)}")
+    # logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    # logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    # logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    # logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    # logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    # global_step = 0
+    # first_epoch = 0
+
+    # # Potentially load in the weights and states from a previous save
+    # if args.resume_from_checkpoint:
+    #     if args.resume_from_checkpoint != "latest":
+    #         path = os.path.basename(args.resume_from_checkpoint)
+    #     else:
+    #         # Get the most recent checkpoint
+    #         dirs = os.listdir(args.output_dir)
+    #         dirs = [d for d in dirs if d.startswith("checkpoint")]
+    #         dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+    #         path = dirs[-1] if len(dirs) > 0 else None
+
+    #     if path is None:
+    #         accelerator.print(
+    #             f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+    #         )
+    #         args.resume_from_checkpoint = None
+    #         initial_global_step = 0
+    #     else:
+    #         accelerator.print(f"Resuming from checkpoint {path}")
+    #         accelerator.load_state(os.path.join(args.output_dir, path))
+    #         global_step = int(path.split("-")[1])
+
+    #         initial_global_step = global_step
+    #         first_epoch = global_step // num_update_steps_per_epoch
+    # else:
+    #     initial_global_step = 0
+
+    # progress_bar = tqdm(
+    #     range(0, args.max_train_steps),
+    #     initial=initial_global_step,
+    #     desc="Steps",
+    #     # Only show the progress bar once on each machine.
+    #     disable=not accelerator.is_local_main_process,
+    # )
+
+    # for epoch in range(first_epoch, args.num_train_epochs):
+    #     unet.train()
+    #     train_loss = 0.0
+    #     for step, batch in enumerate(train_dataloader):
+    #         with accelerator.accumulate(unet, au_encoder):
+    #             # Convert images to latent space
+    #             latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+    #             latents = latents * vae.config.scaling_factor
+
+    #             # Sample noise that we'll add to the latents
+    #             noise = torch.randn_like(latents)
+    #             if args.noise_offset:
+    #                 # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+    #                 noise += args.noise_offset * torch.randn(
+    #                     (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+    #                 )
+
+    #             bsz = latents.shape[0]
+    #             # Sample a random timestep for each image
+    #             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+    #             timesteps = timesteps.long()
+
+    #             # Add noise to the latents according to the noise magnitude at each timestep
+    #             # (this is the forward diffusion process)
+    #             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    #             # Get the text embedding for conditioning
+    #             aus = batch["aus"].float().cuda()
+    #             encoder_hidden_states = text_encoder(batch["tokens"].cuda())[0]
+    #             # # Add random noise to aus and clip to [0, 5]
+    #             aus = torch.clip(aus + torch.randn_like(aus) * 0.2, 0, 5)
+    #             # # Randomly quantize to simulate inference better
+    #             aus = aus.round() if torch.rand(1) < 0.2 else aus
+    #             au_embedding = au_encoder(aus)
+    #             cross_attention_kwargs = {"au_embedding": au_embedding, "au_scale": 1.0}
+
+    #             # Get the target for loss depending on the prediction type
+    #             if args.prediction_type is not None:
+    #                 # set prediction_type of scheduler if defined
+    #                 noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+
+    #             if noise_scheduler.config.prediction_type == "epsilon":
+    #                 target = noise
+    #             elif noise_scheduler.config.prediction_type == "v_prediction":
+    #                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
+    #             else:
+    #                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+    #             # Predict the noise residual and compute loss
+    #             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs).sample
+
+    #             if args.snr_gamma is None:
+    #                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+    #             else:
+    #                 # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+    #                 # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+    #                 # This is discussed in Section 4.2 of the same paper.
+    #                 snr = compute_snr(noise_scheduler, timesteps)
+    #                 if noise_scheduler.config.prediction_type == "v_prediction":
+    #                     # Velocity objective requires that we add one to SNR values before we divide by them.
+    #                     snr = snr + 1
+    #                 mse_loss_weights = (
+    #                     torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+    #                 )
+
+    #                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+    #                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+    #                 loss = loss.mean()
+
+    #             # Gather the losses across all processes for logging (if we use distributed training).
+    #             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+    #             train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
+    #             # Backpropagate
+    #             accelerator.backward(loss)
+    #             if accelerator.sync_gradients:
+    #                 params_to_clip = lora_layers
+    #                 accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+    #             optimizer.step()
+    #             lr_scheduler.step()
+    #             optimizer.zero_grad()
+
+    #         # Checks if the accelerator has performed an optimization step behind the scenes
+    #         if accelerator.sync_gradients:
+    #             progress_bar.update(1)
+    #             global_step += 1
+    #             accelerator.log({"train_loss": train_loss}, step=global_step)
+    #             train_loss = 0.0
+
+    #             if global_step % args.checkpointing_steps == 0:
+    #                 if accelerator.is_main_process:
+    #                     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+    #                     if args.checkpoints_total_limit is not None:
+    #                         checkpoints = os.listdir(args.output_dir)
+    #                         checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+    #                         checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+    #                         # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+    #                         if len(checkpoints) >= args.checkpoints_total_limit:
+    #                             num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+    #                             removing_checkpoints = checkpoints[0:num_to_remove]
+
+    #                             logger.info(
+    #                                 f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+    #                             )
+    #                             logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+    #                             for removing_checkpoint in removing_checkpoints:
+    #                                 removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+    #                                 shutil.rmtree(removing_checkpoint)
+
+    #                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+    #                     accelerator.save_state(save_path)
+
+    #                     unwrapped_unet = accelerator.unwrap_model(unet)
+    #                     filtered_sd = {name: module for name, module in unwrapped_unet.state_dict().items() if "attn2.processor" in name}
+    #                     torch.save(filtered_sd, save_path + "/attn_processors.ckpt")
+    #                     peft_state_dict = get_peft_model_state_dict(unwrapped_unet, adapter_name="unet")
+    #                     StableDiffusionPipeline.save_lora_weights(save_directory=save_path, unet_lora_layers=peft_state_dict)
+
+    #                     unwrapped_encoder = accelerator.unwrap_model(au_encoder)
+    #                     torch.save(unwrapped_encoder.state_dict(), save_path + "/au_encoder.ckpt")
+
+    #                     logger.info(f"Saved state to {save_path}")
+
+    #         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+    #         progress_bar.set_postfix(**logs)
+
+    #         if global_step >= args.max_train_steps:
+    #             break
+
+    #         if accelerator.is_main_process:
+    #             if global_step % args.validation_steps == 0:
+    #                 log_validation(
+    #                     vae,
+    #                     unet,
+    #                     text_encoder,
+    #                     tokenizer,
+    #                     au_encoder,
+    #                     args,
+    #                     accelerator,
+    #                     weight_dtype,
+    #                     global_step,
+    #                 )
+
+    # # Save the lora layers
+    # accelerator.wait_for_everyone()
+    # if accelerator.is_main_process:
+
+    #     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+
+    #     unwrapped_unet = accelerator.unwrap_model(unet)
+    #     filtered_sd = {name: module for name, module in unwrapped_unet.state_dict().items() if "attn2.processor" in name}
+    #     torch.save(filtered_sd, save_path + "/attn_processors.ckpt")
+    #     peft_state_dict = get_peft_model_state_dict(unwrapped_unet, adapter_name="unet")
+    #     StableDiffusionPipeline.save_lora_weights(save_directory=save_path, unet_lora_layers=peft_state_dict)
+        
+    #     unwrapped_encoder = accelerator.unwrap_model(au_encoder)
+    #     torch.save(unwrapped_encoder.state_dict(), save_path + "/au_encoder.ckpt")
+
+
+    # accelerator.end_training()
+
 def main():
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -570,6 +1002,7 @@ def main():
             repo_id = create_repo(
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
+            
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -593,13 +1026,12 @@ def main():
     for attn_module in attn2_modules:
         attn_module.processor.au_to_k = deepcopy(attn_module.to_k)
         attn_module.processor.au_to_v = deepcopy(attn_module.to_v)
+        
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -631,11 +1063,10 @@ def main():
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
-
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
                 logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                    "xFormers 0.0.16 cannot be used for training in some GPUs..."
                 )
             unet.enable_xformers_memory_efficient_attention()
         else:
@@ -644,12 +1075,19 @@ def main():
     au_encoder = AUEncoder().cuda().requires_grad_(True)
     au_encoder.train()
     
+    # =========================================================
+    # 创新点 3：加载预训练的 ArcFace 模型用于身份保留约束
+    # =========================================================
+    logger.info("Loading ArcFace model for Identity Preservation...")
+    arcface = InceptionResnetV1(pretrained='vggface2').eval().cuda()
+    for param in arcface.parameters():
+        param.requires_grad = False
+    # =========================================================
+
     from itertools import chain
 
     lora_layers = filter(lambda p: p.requires_grad, chain(unet.parameters(), au_encoder.parameters()))
 
-    # Enable TF32 for faster training on Ampere GPUs,
-    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -663,10 +1101,7 @@ def main():
         try:
             import bitsandbytes as bnb
         except ImportError:
-            raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
-            )
-
+            raise ImportError("Please install bitsandbytes...")
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
@@ -680,31 +1115,23 @@ def main():
     )
 
     disfa_dataset = load_disfa(args.disfa_image_path, args.disfa_label_path, args.disfa_captions_file)
-
     an_dataset = load_affectnet(args.affectnet_rar_file, args.affectnet_csv_path)
 
     train_dataset = concatenate_datasets([an_dataset, disfa_dataset])
-    # Overwrite image feature
     train_dataset.info.features["image"] = an_dataset.features["image"]
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
             train_dataset = train_dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        #train_dataset = train_dataset.with_transform(preprocess_train)
-
     
     def collate_fn(examples):
-        # Images to pixels
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        # Get AUs
         aus = torch.stack([example["aus"] for example in examples])
         caption = [example["caption"] for example in examples]
         tokens = torch.stack([tokenize_prompt(tokenizer, example["caption"]) for example in examples])
         return {"pixel_values": pixel_values, "aus": aus, "caption": caption, "tokens": tokens}
 
-    # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -713,7 +1140,6 @@ def main():
         num_workers=args.dataloader_num_workers,
     )
 
-    # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -727,24 +1153,18 @@ def main():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    # Prepare everything with our `accelerator`.
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
     )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
 
-    # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
@@ -757,12 +1177,10 @@ def main():
     global_step = 0
     first_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
-            # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
@@ -778,7 +1196,6 @@ def main():
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
-
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
     else:
@@ -788,7 +1205,6 @@ def main():
         range(0, args.max_train_steps),
         initial=initial_global_step,
         desc="Steps",
-        # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
 
@@ -797,40 +1213,29 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet, au_encoder):
-                # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
-                # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn(
                         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
                     )
 
                 bsz = latents.shape[0]
-                # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning
                 aus = batch["aus"].float().cuda()
                 encoder_hidden_states = text_encoder(batch["tokens"].cuda())[0]
-                # # Add random noise to aus and clip to [0, 5]
                 aus = torch.clip(aus + torch.randn_like(aus) * 0.2, 0, 5)
-                # # Randomly quantize to simulate inference better
                 aus = aus.round() if torch.rand(1) < 0.2 else aus
                 au_embedding = au_encoder(aus)
                 cross_attention_kwargs = {"au_embedding": au_embedding, "au_scale": 1.0}
 
-                # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
                     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -840,32 +1245,113 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs).sample
 
+                # =========================================================
+                # 计算原始去噪 MSE 损失
+                # =========================================================
                 if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
                     snr = compute_snr(noise_scheduler, timesteps)
                     if noise_scheduler.config.prediction_type == "v_prediction":
-                        # Velocity objective requires that we add one to SNR values before we divide by them.
                         snr = snr + 1
                     mse_loss_weights = (
                         torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
                     )
+                    loss_temp = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss_temp = loss_temp.mean(dim=list(range(1, len(loss_temp.shape)))) * mse_loss_weights
+                    mse_loss = loss_temp.mean()
 
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                # # =========================================================
+                # # 创新点 3：计算 Identity 保留约束损失 (ID Loss)
+                # # =========================================================
+                # # 1. 估算去噪后的 x0 潜变量
+                # alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps].to(latents.device)
+                # beta_prod_t = 1 - alpha_prod_t
+                
+                # # 【修复核心 1】：强行托底，防止极大时间步时 alpha_t 接近 0 导致分母极小！
+                # alpha_prod_t = torch.clamp(alpha_prod_t, min=1e-4)
+                
+                # alpha_prod_t = alpha_prod_t.view(-1, 1, 1, 1)
+                # beta_prod_t = beta_prod_t.view(-1, 1, 1, 1)
+                
+                # pred_x0_latent = (noisy_latents - beta_prod_t ** (0.5) * model_pred) / alpha_prod_t ** (0.5)
 
-                # Gather the losses across all processes for logging (if we use distributed training).
+                # # 【修复核心 2】：将推导出来的特征张量强行锁在 [-10, 10] 的安全范围内。
+                # # 这彻底杜绝了数值溢出导致 VAE 内部算子崩溃的问题！
+                # pred_x0_latent = torch.clamp(pred_x0_latent, min=-10.0, max=10.0)
+
+                # # 2. VAE 解码为图片 (为省显存，每个批次最多抽取 4 张图算 ID Loss)
+                # sample_num = min(4, bsz)
+                # pred_x0_image = vae.decode(pred_x0_latent[:sample_num].to(weight_dtype) / vae.config.scaling_factor).sample
+
+                # # 3. 变换尺寸以符合 ArcFace 输入 (160x160)
+                # pred_face_resized = F.interpolate(pred_x0_image, size=(160, 160), mode='bilinear')
+                # gt_face_resized = F.interpolate(gt_image, size=(160, 160), mode='bilinear')
+
+                # # 4. 提取 FaceID 特征并计算相似度损失
+                # pred_id = arcface(pred_face_resized)
+                # gt_id = arcface(gt_face_resized)
+                # id_loss = 1.0 - F.cosine_similarity(pred_id, gt_id).mean()
+                
+                # # 5. 总损失：原 MSE 损失 + 权重为 0.1 的身份保留损失
+                # lambda_id = 0.1
+                # loss = mse_loss + lambda_id * id_loss
+                # =========================================================
+                # =========================================================
+
+                # =========================================================
+                # 创新点 3：计算 Identity 保留约束损失 (ID Loss) - 终极修复版
+                # =========================================================
+                # 【核心修复 1】：为了防止 VAE 反向传播导致显存窒息，每个 batch 严格只挑 1 张图算 ID Loss！
+                sample_num = 1 
+                
+                alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps].to(latents.device).float()
+                beta_prod_t = 1.0 - alpha_prod_t
+                alpha_prod_t = torch.clamp(alpha_prod_t, min=1e-5)
+                
+                alpha_prod_t = alpha_prod_t.view(-1, 1, 1, 1)
+                beta_prod_t = beta_prod_t.view(-1, 1, 1, 1)
+                
+                noisy_latents_f32 = noisy_latents.float()
+                model_pred_f32 = model_pred.float()
+                
+                pred_x0_latent = (noisy_latents_f32 - beta_prod_t ** (0.5) * model_pred_f32) / alpha_prod_t ** (0.5)
+
+                pred_x0_latent = torch.nan_to_num(pred_x0_latent, nan=0.0, posinf=10.0, neginf=-10.0)
+                pred_x0_latent = torch.clamp(pred_x0_latent, min=-10.0, max=10.0)
+
+                # 【核心修复 2】：强制关闭自动混合精度，隔离老旧模型带来的精度崩溃
+                with torch.autocast("cuda", enabled=False):
+                    # 潜变量转回 VAE 需要的精度进行解码
+                    pred_x0_image = vae.decode(pred_x0_latent[:sample_num].to(weight_dtype) / vae.config.scaling_factor).sample
+                    
+                    # 解码后立刻转为 fp32 并清洗
+                    pred_x0_image = pred_x0_image.float() 
+                    pred_x0_image = torch.nan_to_num(pred_x0_image, nan=0.0, posinf=1.0, neginf=-1.0)
+
+                    gt_image = batch["pixel_values"][:sample_num].float()
+
+                    # 【核心修复 3】：加上 .contiguous()，强制内存在物理上连续，这是解决找不到 Engine 的绝杀！
+                    pred_face_resized = F.interpolate(pred_x0_image, size=(160, 160), mode='bilinear').contiguous()
+                    gt_face_resized = F.interpolate(gt_image, size=(160, 160), mode='bilinear').contiguous()
+
+                    # 提取 FaceID 特征
+                    pred_id = arcface(pred_face_resized)
+                    gt_id = arcface(gt_face_resized)
+                    
+                    id_loss = 1.0 - F.cosine_similarity(pred_id, gt_id).mean()
+                    id_loss = torch.nan_to_num(id_loss, nan=0.0)
+                
+                # 总损失：原 MSE 损失 + 权重为 0.1 的身份保留损失
+                lambda_id = 0.1
+                loss = mse_loss + lambda_id * id_loss
+                # =========================================================
+
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = lora_layers
@@ -874,7 +1360,6 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
@@ -883,22 +1368,14 @@ def main():
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
                                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
@@ -926,21 +1403,12 @@ def main():
             if accelerator.is_main_process:
                 if global_step % args.validation_steps == 0:
                     log_validation(
-                        vae,
-                        unet,
-                        text_encoder,
-                        tokenizer,
-                        au_encoder,
-                        args,
-                        accelerator,
-                        weight_dtype,
-                        global_step,
+                        vae, unet, text_encoder, tokenizer, au_encoder,
+                        args, accelerator, weight_dtype, global_step,
                     )
 
-    # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-
         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
 
         unwrapped_unet = accelerator.unwrap_model(unet)
@@ -951,7 +1419,6 @@ def main():
         
         unwrapped_encoder = accelerator.unwrap_model(au_encoder)
         torch.save(unwrapped_encoder.state_dict(), save_path + "/au_encoder.ckpt")
-
 
     accelerator.end_training()
 

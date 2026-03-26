@@ -224,7 +224,23 @@ class AUAttnProcessor(nn.Module):
 
         # 核心修改：不使用导致全局污染的 Softmax，而是用 Sigmoid 生成空间热力图
         au_attention_scores = torch.bmm(query, au_key.transpose(-1, -2)) * attn.scale
-        spatial_mask = torch.sigmoid(au_attention_scores)
+        # 引入放大因子 10.0，打破 Sigmoid(0)=0.5 的初始死亡区！
+        # 让稍微匹配的特征迅速接近 1，不匹配的迅速接近 0
+        temperature = 10.0 
+        spatial_mask = torch.sigmoid(au_attention_scores * temperature)
+        
+        # ====== 抽样可视化：不断覆盖临时文件 ======
+        seq_len = spatial_mask.shape[1]
+        side_len = int(seq_len ** 0.5)
+        
+        # 只抓取 64x64 分辨率的掩码
+        if side_len * side_len == seq_len and side_len == 64:
+            heatmap_2d = spatial_mask[0, :, 0].view(side_len, side_len).detach().cpu().float()
+            heatmap_img = (heatmap_2d.numpy() * 255).astype('uint8')
+            
+            from PIL import Image
+            # 永远只覆盖保存这一张临时图，绝不堆积
+            Image.fromarray(heatmap_img).save("temp_spatial_mask.png")
         
         au_hidden_states = torch.bmm(spatial_mask, au_value)
         au_hidden_states = attn.batch_to_head_dim(au_hidden_states)

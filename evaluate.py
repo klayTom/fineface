@@ -20,7 +20,7 @@ from fineface.fineface_pipeline import AUEncoder, FineFacePipeline
 # 用户配置区 (请根据 AutoDL 实际路径修改)
 # ==========================================
 # 你的模型权重最终保存路径
-MODEL_WEIGHT_PATH = "/root/autodl-tmp/fineface/fineface/checkpoint-20000"  
+MODEL_WEIGHT_PATH = "/root/autodl-tmp/fineface/fineface_spatial_id_ours/checkpoint-20000"  
 NUM_AUS = 12  
 
 # 严格对齐 au_dataset.py 中的 [1, 2, 4, 5, 6, 9, 12, 15, 17, 20, 25, 26]
@@ -45,7 +45,7 @@ def init_eval_models(device="cuda"):
     return clip_processor, clip_model, au_detector
 
 def get_1650_test_cases():
-    """严格按照论文 Testing details 构建 1650 个合成测试用例"""
+    """严格按照论文 Testing details 构建 1650 个合成测试用例，并加入解剖学互斥校验"""
     prompts = [
         "a photo of a person", "a closeup portrait of a man", "a closeup portrait of a woman",
         "a clear frontal face photo", "a detailed studio headshot", "a cinematic face portrait",
@@ -56,9 +56,28 @@ def get_1650_test_cases():
     
     test_cases = []
     
+    # ========================================================
+    # 新增：定义物理上互斥的 AU 组合 (使用索引表示)
+    # 索引对照:
+    # 0: AU1, 1: AU2, 2: AU4, 3: AU5, 4: AU6, 5: AU9, 
+    # 6: AU12, 7: AU15, 8: AU17, 9: AU20, 10: AU25, 11: AU26
+    # ========================================================
+    MUTUALLY_EXCLUSIVE_GROUPS = [
+        {6, 7},   # AU12 (微笑) vs AU15 (嘴角下拉) 
+        {1, 2},   # AU2 (外侧眉毛上抬) vs AU4 (眉毛下压)
+        # 注: AU1(内侧眉抬起)和AU4(下压)有时能共存(形成悲伤的八字眉)，所以不强制互斥
+    ]
+    
+    def is_valid_combination(indices):
+        idx_set = set(indices)
+        for group in MUTUALLY_EXCLUSIVE_GROUPS:
+            # 如果随机抽取的集合中，包含了某个互斥组中的 2 个元素，则不合法
+            if len(idx_set.intersection(group)) > 1:
+                return False
+        return True
+
     for prompt in prompts:
-        # 1. 单独 AU 测试: 12种AU * 5种强度 = 60个用例/Prompt
-        # 注意！因为训练数据被缩放到了 0-5 分，所以这里的 5 种强度设定为 1 到 5
+        # 1. 单独 AU 测试: 12种AU * 5种强度 = 60个用例/Prompt (单AU不存在互斥问题)
         intensities = [1.0, 2.0, 3.0, 4.0, 5.0]
         for au_idx in range(NUM_AUS):
             for intensity in intensities:
@@ -70,12 +89,17 @@ def get_1650_test_cases():
                     "type": f"single_AU_idx{au_idx}_int{intensity}"
                 })
                 
-        # 2. 组合 AU 测试: 每种 Prompt 随机生成 50 组 AU
-        # 随机激活 2-4 个 AU，强度在 1.0 ~ 5.0 之间随机
+        # 2. 组合 AU 测试: 每种 Prompt 随机生成 50 组合法的 AU
         for i in range(50):
             au_tensor = torch.zeros((1, NUM_AUS), dtype=torch.float16)
             num_active = np.random.randint(2, 5) 
-            active_indices = np.random.choice(NUM_AUS, num_active, replace=False)
+            
+            # 引入 while 循环：只有抽到符合人类解剖学的 AU 组合才放行
+            while True:
+                active_indices = np.random.choice(NUM_AUS, num_active, replace=False)
+                if is_valid_combination(active_indices):
+                    break
+                    
             for idx in active_indices:
                 au_tensor[0, idx] = np.round(np.random.uniform(1.0, 5.0), 1)
                 
@@ -85,7 +109,6 @@ def get_1650_test_cases():
                 "type": f"combo_random_{i}"
             })
             
-    # 共 15 * (60 + 50) = 1650 个用例
     return test_cases
 
 def load_local_fineface(model_path, device="cuda"):
@@ -215,20 +238,39 @@ def main():
                     total_au_mse += au_mse
                     valid_samples += 1
                     
-                    # 4. 记录到 Wandb
-                    if step % 50 == 0:
-                        wandb.log({
-                            "eval/step_clip_i": clip_i,
-                            "eval/step_au_mse": au_mse,
-                            "visual/neutral_Y0": wandb.Image(img_neutral, caption=f"Neutral"),
-                            "visual/cond_Yau": wandb.Image(img_cond, caption=f"{item['type']}\nCLIP-I: {clip_i:.3f}, MSE: {au_mse:.3f}")
-                        }, step=step)
-                    else:
-                        wandb.log({
-                            "eval/step_clip_i": clip_i,
-                            "eval/step_au_mse": au_mse,
-                        }, step=step)
+                    # # 4. 记录到 Wandb
+                    # if step % 50 == 0:
+                    #     wandb.log({
+                    #         "eval/step_clip_i": clip_i,
+                    #         "eval/step_au_mse": au_mse,
+                    #         "visual/neutral_Y0": wandb.Image(img_neutral, caption=f"Neutral"),
+                    #         "visual/cond_Yau": wandb.Image(img_cond, caption=f"{item['type']}\nCLIP-I: {clip_i:.3f}, MSE: {au_mse:.3f}")
+                    #     }, step=step)
+                    # else:
+                    #     wandb.log({
+                    #         "eval/step_clip_i": clip_i,
+                    #         "eval/step_au_mse": au_mse,
+                    #     }, step=step)
+
+                    # 4. 记录到 Wandb (加入了空间热力图的抽样上传机制)
+                    log_dict = {
+                        "eval/step_clip_i": clip_i,
+                        "eval/step_au_mse": au_mse,
+                    }
+                    
+                    # 抽样策略：前 5 张必传（方便一上来就检查效果），之后每隔 50 张传一次
+                    if step < 5 or step % 50 == 0:
+                        log_dict["visual/neutral_Y0"] = wandb.Image(img_neutral, caption="Neutral")
+                        log_dict["visual/cond_Yau"] = wandb.Image(img_cond, caption=f"{item['type']}\nCLIP-I: {clip_i:.3f}, MSE: {au_mse:.3f}")
                         
+                        # 【核心】：去硬盘上摸一下那张临时热力图，如果有，就打包一起传上 WandB
+                        if os.path.exists("temp_spatial_mask.png"):
+                            mask_img = Image.open("temp_spatial_mask.png")
+                            log_dict["visual/spatial_mask"] = wandb.Image(mask_img, caption=f"Mask for Step {step}")
+
+                    wandb.log(log_dict, step=step) 
+                    
+
             except Exception as e:
                 # 如果数据格式严重错误，捕获异常并跳过，防止脚本崩溃
                 print(f"\n[警告] Step {step}: AU 提取异常，已跳过。原因: {e}")

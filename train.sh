@@ -10,7 +10,7 @@ ARGS=(
   --gradient_accumulation_steps=3
   --mixed_precision="fp16"
   --gradient_checkpointing
-  --checkpointing_steps=5000
+  --checkpointing_steps=10000
   --max_train_steps=20000
   --validation_steps=2000
   --learning_rate=1e-04

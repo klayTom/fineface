@@ -101,6 +101,12 @@ class AUAttnProcessor(nn.Module):
         self.au_to_k = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
         self.au_to_v = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
 
+        # 🔥 注册为可学习参数
+        # 初始温度设为 1.0
+        self.temperature = nn.Parameter(torch.ones(1))
+        # 初始门控设为 0.0（Zero-Initialization，彻底解决信号爆炸）
+        self.au_gate = nn.Parameter(torch.zeros(1))
+
     def __call__(
         self,
         attn,
@@ -222,30 +228,37 @@ class AUAttnProcessor(nn.Module):
         au_key = attn.head_to_batch_dim(au_key).to(query.dtype)
         au_value = attn.head_to_batch_dim(au_value).to(query.dtype)
 
-        # 核心修改：不使用导致全局污染的 Softmax，而是用 Sigmoid 生成空间热力图
-        au_attention_scores = torch.bmm(query, au_key.transpose(-1, -2)) * attn.scale
-        # 引入放大因子 10.0，打破 Sigmoid(0)=0.5 的初始死亡区！
-        # 让稍微匹配的特征迅速接近 1，不匹配的迅速接近 0
-        temperature = 10.0 
-        spatial_mask = torch.sigmoid(au_attention_scores * temperature)
+        # 1. 计算 attention score
+        au_attention_scores = torch.bmm(query, au_key.transpose(-1, -2))
+        
+        # 2. 归一化
+        au_attention_scores = au_attention_scores * attn.scale
+        
+        # 3. 加温度 (加 abs() 防止学出负数导致逻辑反转)
+        au_attention_scores = au_attention_scores / (self.temperature.abs() + 1e-6)
+        
+        # 4. Sigmoid gating
+        spatial_mask = torch.sigmoid(au_attention_scores)
+        
+        # 5. Residual gating
+        spatial_mask = spatial_mask * 0.9 + 0.1
         
         # ====== 抽样可视化：不断覆盖临时文件 ======
         seq_len = spatial_mask.shape[1]
         side_len = int(seq_len ** 0.5)
         
-        # 只抓取 64x64 分辨率的掩码
         if side_len * side_len == seq_len and side_len == 64:
             heatmap_2d = spatial_mask[0, :, 0].view(side_len, side_len).detach().cpu().float()
             heatmap_img = (heatmap_2d.numpy() * 255).astype('uint8')
-            
             from PIL import Image
-            # 永远只覆盖保存这一张临时图，绝不堆积
             Image.fromarray(heatmap_img).save("temp_spatial_mask.png")
         
+        # 6. 提取特征
         au_hidden_states = torch.bmm(spatial_mask, au_value)
         au_hidden_states = attn.batch_to_head_dim(au_hidden_states)
 
-        hidden_states = hidden_states + au_scale * au_hidden_states
+        # 7. 注入 (配合 Zero-Gating，平滑起步)
+        hidden_states = hidden_states + au_scale * self.au_gate * au_hidden_states
         # =========================================================
 
         # linear proj

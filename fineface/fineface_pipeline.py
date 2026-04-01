@@ -9,22 +9,39 @@ from fineface.au_attention import hack_unet_attn_layers, AUAttnProcessor
 class AUEncoder(torch.nn.Module):
     def __init__(self, number_of_aus: int = 12, hidden_dim: int = 64, clip_dim: int = 1024, pad_zeros: bool = True):
         super().__init__()
-        self.au_encoder = nn.Linear(number_of_aus, hidden_dim)
         self.n_aus = number_of_aus
-        self.hidden_dim = hidden_dim
         self.clip_dim = clip_dim
-        self.pad_zeros = pad_zeros
         
+        # 修改 1：放大身份初始化权重 (从 0.02 提升到 0.1)，强行拉开 12 个 Token 的初始距离
+        self.au_embeds = nn.Parameter(torch.randn(number_of_aus, clip_dim) * 0.1)
+        
+        # 修改 2：为 12 个 AU 分别建立【独立】的 MLP 映射网络
+        # 彻底杜绝不同 AU 输入相同强度时产生相同的特征！
+        self.intensity_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, 128),
+                nn.SiLU(),
+                nn.Linear(128, clip_dim)
+            ) for _ in range(number_of_aus)
+        ])
+
     def forward(self, x):
-        x = x.clone()
-        x = torch.cat([x, self.au_encoder(x)], dim=1)
-        if self.pad_zeros:
-            x = torch.cat([
-                x,
-                torch.zeros(x.shape[0], self.clip_dim - self.n_aus - self.hidden_dim).float().to(x.device)
-            ], dim=1)
-        x = x.reshape(-1, 1, self.clip_dim)
-        return x
+        # x 形状: (Batch, 12)
+        x_expanded = x.unsqueeze(-1) # (Batch, 12, 1)
+        
+        features = []
+        for i in range(self.n_aus):
+            # 第 i 个 AU 的强度【只】通过第 i 个专属的 MLP
+            feat = self.intensity_mlps[i](x_expanded[:, i, :])
+            features.append(feat)
+            
+        # 将 12 个截然不同的特征拼接起来: (Batch, 12, clip_dim)
+        intensity_features = torch.stack(features, dim=1)
+        
+        # 加上专属身份 Embedding
+        out = intensity_features + self.au_embeds.unsqueeze(0)
+        
+        return out
 
 
 class FineFacePipeline:

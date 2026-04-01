@@ -1083,11 +1083,28 @@ def main():
     for param in arcface.parameters():
         param.requires_grad = False
     # =========================================================
-
     from itertools import chain
+    # =========================================================
+    # 核心修改：将参数分组，为自定义门控分配 10倍 学习率
+    # =========================================================
+    custom_params = []
+    base_params = []
+    
+    # 1. 遍历并筛选需要更新的参数
+    for name, param in chain(unet.named_parameters(), au_encoder.named_parameters()):
+        if not param.requires_grad:
+            continue
+        # 如果是我们自己加的 au_gate 或 temperature，放进 custom_params
+        if "au_gate" in name or "temperature" in name:
+            custom_params.append(param)
+        else:
+            base_params.append(param)
 
-    lora_layers = filter(lambda p: p.requires_grad, chain(unet.parameters(), au_encoder.parameters()))
+    # 2. 重新定义 lora_layers，这一步极其关键！
+    # 把两组参数合并成一个列表，给后面的梯度裁剪（clip_grad_norm_）使用，防止报错
+    lora_layers = base_params + custom_params
 
+    # 3. 基础学习率配置
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -1095,6 +1112,12 @@ def main():
         args.learning_rate = (
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
+
+    # 4. 设置分组学习率 (基础参数用基础LR，自定义参数用10倍LR)
+    optimizer_groups = [
+        {"params": base_params, "lr": args.learning_rate},
+        {"params": custom_params, "lr": args.learning_rate * 10.0}
+    ]
 
     # Initialize the optimizer
     if args.use_8bit_adam:
@@ -1106,13 +1129,14 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    # 5. 将配置好的 optimizer_groups 喂给优化器
     optimizer = optimizer_cls(
-        lora_layers,
-        lr=args.learning_rate,
+        optimizer_groups,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    # =========================================================
 
     disfa_dataset = load_disfa(args.disfa_image_path, args.disfa_label_path, args.disfa_captions_file)
     an_dataset = load_affectnet(args.affectnet_rar_file, args.affectnet_csv_path)
@@ -1366,6 +1390,38 @@ def main():
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
 
+                # =========================================================
+                # 每 100 步提取 12 通道 Mask 并上传 WandB
+                # =========================================================
+                if global_step % 100 == 0 and accelerator.is_main_process:
+                    import torchvision
+                    # 遍历 UNet 找到挂载了 Mask 的 Attention 处理器
+                    for module in accelerator.unwrap_model(unet).modules():
+                        if hasattr(module, 'current_spatial_mask') and getattr(module, 'current_spatial_mask', None) is not None:
+                            raw_mask = module.current_spatial_mask 
+                            
+                            # 核心修复：现在的 raw_mask 已经是 12 个 Token 了
+                            # 取出第一组 (Batch 0)，维度从 (4096, 12) 转换为 (12, 1, 64, 64)
+                            vis_mask = raw_mask[0].permute(1, 0).view(12, 1, 64, 64).float()
+                            
+                            # 保存到本地磁盘
+                            save_dir = os.path.join(args.output_dir, "spatial_masks")
+                            os.makedirs(save_dir, exist_ok=True)
+                            mask_path = os.path.join(save_dir, f"mask_step_{global_step}.png")
+                            
+                            # 将 12 张图拼成 4列3行 的网格图，并做归一化增强对比度
+                            torchvision.utils.save_image(vis_mask, mask_path, nrow=4, normalize=True, scale_each=True)
+                            
+                            # 推送到 WandB 仪表盘
+                            if accelerator.trackers:
+                                import wandb
+                                accelerator.log({
+                                    "visual/spatial_mask_train": wandb.Image(mask_path, caption=f"Step {global_step} (12 Independent AUs)")
+                                }, step=global_step)
+                                
+                            break # 只拿其中一个 64x64 层画图就够了，跳出循环
+                # =========================================================
+                
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         if args.checkpoints_total_limit is not None:

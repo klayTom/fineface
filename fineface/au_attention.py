@@ -104,8 +104,8 @@ class AUAttnProcessor(nn.Module):
         # 🔥 注册为可学习参数
         # 初始温度设为 1.0
         self.temperature = nn.Parameter(torch.ones(1))
-        # 初始门控设为 0.0（Zero-Initialization，彻底解决信号爆炸）
-        self.au_gate = nn.Parameter(torch.zeros(1))
+        # 🔥 修改：将 zeros(1) 换成 1e-4，打破梯度死锁！
+        self.au_gate = nn.Parameter(torch.tensor([1e-4]))
 
     def __call__(
         self,
@@ -240,18 +240,51 @@ class AUAttnProcessor(nn.Module):
         # 4. Sigmoid gating
         spatial_mask = torch.sigmoid(au_attention_scores)
         
-        # 5. Residual gating
-        spatial_mask = spatial_mask * 0.9 + 0.1
-        
-        # ====== 抽样可视化：不断覆盖临时文件 ======
-        seq_len = spatial_mask.shape[1]
+        # =========================================================
+        # 创新点：Gaussian Face Prior (面部高斯先验引导)
+        # =========================================================
+        seq_len = spatial_mask.shape[1] 
         side_len = int(seq_len ** 0.5)
         
+        # 确保当前层是一个正方形的特征图（扩散模型里通常是 64x64, 32x32, 16x16）
+        if side_len * side_len == seq_len:
+            # 动态生成二维高斯分布 (为了不拖慢训练，只有第一步时计算，之后缓存复用)
+            if not hasattr(self, 'face_prior') or getattr(self, 'face_prior').shape[0] != seq_len:
+                device = query.device
+                
+                # 生成坐标网格 (范围从 -1 到 1)
+                y, x = torch.meshgrid(
+                    torch.linspace(-1, 1, side_len, device=device), 
+                    torch.linspace(-1, 1, side_len, device=device), 
+                    indexing='ij'
+                )
+                
+                # 计算二维高斯分布。
+                # sigma=0.55 是一个经验值：刚好覆盖人脸的五官，并让边角的权重迅速衰减为 0
+                gaussian = torch.exp(-(x**2 + y**2) / (2 * 0.55**2))
+                
+                # 展平为 (seq_len, 1)，比如 (4096, 1)，并对齐数据类型
+                self.face_prior = gaussian.view(-1, 1).to(query.dtype)
+            
+            # 【绝杀操作】：将网络算出来的 mask 直接乘上高斯先验！
+            # spatial_mask 形状为 (Batch*Heads, 4096, 12)
+            # self.face_prior 形状为 (4096, 1)
+            # PyTorch 会自动在最后一个维度广播，让 12 个 AU 同时被屏蔽掉背景
+            spatial_mask = spatial_mask * self.face_prior
+        # =========================================================
+        
+        # 5. Residual gating (依然保留一点点底噪，防止死锁)
+        spatial_mask = spatial_mask * 0.9 + 0.1
+        
+       # ====== 内存挂载：提取 12通道 Mask 供 train.py 可视化 ======
         if side_len * side_len == seq_len and side_len == 64:
-            heatmap_2d = spatial_mask[0, :, 0].view(side_len, side_len).detach().cpu().float()
-            heatmap_img = (heatmap_2d.numpy() * 255).astype('uint8')
-            from PIL import Image
-            Image.fromarray(heatmap_img).save("temp_spatial_mask.png")
+            # 此时 spatial_mask 形状为 (Batch*Heads, 4096, 12)
+            # 使用 .detach().clone() 安全剥离计算图
+            self.current_spatial_mask = spatial_mask.detach().clone()
+        # =========================================================
+        
+        # 6. 提取特征
+        au_hidden_states = torch.bmm(spatial_mask, au_value)
         
         # 6. 提取特征
         au_hidden_states = torch.bmm(spatial_mask, au_value)

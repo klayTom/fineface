@@ -164,21 +164,59 @@ def log_validation(
     ]
     with torch.autocast("cuda"):
         images = []
+        mask_images = [] # [新增] 用于存放提取出来的热力图
+        
         for au in aus:
             torch.manual_seed(4)
+            # 生成人脸图像
             image = pipeline(prompt, au, num_inference_steps=200, guidance_scale=7.5)[0]
             images.append(image)
+
+            # ========================================================
+            # [新增核心逻辑]: 去 UNet 里“打捞”刚刚算出来的 Spatial Mask
+            # ========================================================
+            current_mask = None
+            unwrapped_unet = accelerator.unwrap_model(unet)
+            for name, processor in unwrapped_unet.named_modules():
+                if hasattr(processor, 'current_spatial_mask') and processor.current_spatial_mask is not None:
+                    # 取出特征图 (seq_len, 12)
+                    mask_tensor = processor.current_spatial_mask[0] 
+                    seq_len = mask_tensor.shape[0]
+                    size = int(np.sqrt(seq_len))
+                    
+                    # 寻找一个分辨率够大（至少 16x16 或 32x32）的 Attention 层来可视化
+                    if size * size == seq_len and size >= 16:
+                        # 把 12 个 AU 的激活区域叠加在一起，看整体的形变范围
+                        spatial_map = mask_tensor.max(dim=-1)[0].float().numpy()
+                        # 归一化到 0-255 以生成图片
+                        spatial_map = (spatial_map - spatial_map.min()) / (spatial_map.max() - spatial_map.min() + 1e-8)
+                        spatial_map = (spatial_map * 255).astype(np.uint8)
+                        
+                        # 缩放到 512x512 方便和原图对比
+                        current_mask = Image.fromarray(spatial_map).resize((512, 512), resample=Image.NEAREST)
+                        break # 捞到一张足够清晰的 Mask 就退出当前循环
+            
+            if current_mask is not None:
+                mask_images.append(current_mask)
+            else:
+                # 极端情况下没抓到，给张全黑占位图防止崩溃
+                mask_images.append(Image.new("L", (512, 512), 0))
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
+            # [修改]: 将人脸图和 Mask 图分离上传到 WandB 的不同面板
             tracker.log(
                 {
-                    "test": [
-                        wandb.Image(image, caption=f"{i}: {str(aus[i].round())}")
+                    "test_images": [
+                        wandb.Image(image, caption=f"Img {i}: {str(aus[i].round())}")
                         for i, image in enumerate(images)
+                    ],
+                    "test_masks": [
+                        wandb.Image(mask, caption=f"Mask {i}: {str(aus[i].round())}")
+                        for i, mask in enumerate(mask_images)
                     ]
                 }
             )

@@ -119,12 +119,12 @@ class AUAttnProcessor(nn.Module):
             nn.Linear(hidden_size // 2, hidden_size)
         )
         
-        # =========================================================================
-        # [融合机制创新点 2]: 显式空间路由温度系数 (Routing Temperature)
-        # 作用：原版的 Attention Map 是弥散的。加入可学习温度后，能让 Mask 变得锐利，
-        # 强迫每个 AU 只精准路由到那几块特定的面部肌肉像素上。
-        # =========================================================================
-        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+        # 【修改这里：留一条门缝给梯度】
+        nn.init.zeros_(self.au_gate[2].weight)
+        nn.init.constant_(self.au_gate[2].bias, -1.5) # 从 -4.0 改为 -1.5 (Sigmoid约等于0.18)
+        
+        # Temperature 保持 5.0 锐化不变
+        self.temperature = nn.Parameter(torch.ones(1) * 5.0)
 
     def __call__(
         self,

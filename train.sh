@@ -22,7 +22,6 @@ ARGS=(
   --caption_column="aus"
   --report_to="wandb"
   --rank=32
-  --resume_from_checkpoint "latest"
   --disfa_image_path="/root/autodl-tmp/dataset/disfa/aligned"
   --disfa_label_path="/root/autodl-tmp/dataset/disfa/DISFA/ActionUnit_Labels"
   --disfa_captions_file="/root/autodl-tmp/dataset/disfa/disfa_captions.csv"

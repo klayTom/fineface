@@ -45,8 +45,14 @@ class AUEncoder(torch.nn.Module):
         self.gcn1 = nn.Linear(hidden_dim, hidden_dim)
         self.gcn2 = nn.Linear(hidden_dim, clip_dim)
         
-        # 专属身份偏置初始化 (放大方差)
-        self.au_embeds = nn.Parameter(torch.randn(number_of_aus, clip_dim) * 0.1)
+        # 【修改这里：打破梯度死锁】
+        # 将 zeros_ 替换为 std=0.01 的微小正态分布。
+        # 这样初始特征在 0 附近极微小震荡，既不会瞬间崩坏画风，又能产生非零梯度！
+        nn.init.normal_(self.gcn2.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.gcn2.bias) # bias 依然可以为 0
+        
+        # 专属身份偏置初始化 (给 1e-4 的扰动)
+        self.au_embeds = nn.Parameter(torch.randn(number_of_aus, clip_dim) * 1e-4)
 
     def forward(self, x):
         # x 形状: (Batch, 12)

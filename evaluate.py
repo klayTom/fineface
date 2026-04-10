@@ -46,8 +46,8 @@ def get_1650_test_cases():
     """严格按照论文 Testing details 构建 1650 个合成测试用例"""
     # 2 
     prompts = [
-         "a close up of a person wearing a fur coat", "a closeup portrait of a man", "a closeup portrait of a woman",
-        "a close up of a woman with pink lipstick", "a woman with a bloody face and glasses", "a close up of a person wearing a suit and tie",
+         "a clear frontal face photo", "a closeup portrait of a man", "a closeup portrait of a woman",
+        "a professional id photo", "a woman with a bloody face and glasses", "a close up of a person wearing a suit and tie",
         "a close up of a person wearing a fur collar", "a realistic portrait of a young boy", "a close up of a person wearing a hat",
         "a photo of a young girl", "a close up of a person wearing a jacket", "a close up of a woman with blue eyes",
         "a close up of a child's face with blue eyes", "a symmetrical face photo", "a black and white photo of a woman's face"

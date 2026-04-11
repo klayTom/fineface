@@ -105,26 +105,29 @@ class AttnProcessor(nn.Module):
 class AUAttnProcessor(nn.Module):
     def __init__(self, hidden_size, cross_attention_dim=None):
         super().__init__()
+
+        self.hidden_size = hidden_size
+
+        # === AU → K,V 投影 ===
         self.au_to_k = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
         self.au_to_v = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
 
-        # =========================================================================
-        # [融合机制创新点 1]: 空间感知特征调制门控 (Spatial Modulation Gate)
-        # 作用：它会读取 Attention 提纯后的局部特征，计算出一个 [0, 1] 的激活系数。
-        # 只有在确实需要形变的像素点，它才会放行 AU 特征，彻底保护背景和无辜五官。
-        # =========================================================================
+        # === Spatial Modulation Gate（FiLM-like） ===
         self.au_gate = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.SiLU(),
             nn.Linear(hidden_size // 2, hidden_size)
         )
-        
-        # 【修改这里：留一条门缝给梯度】
+
+        # 🔥 更合理初始化（不会一开始全关）
         nn.init.zeros_(self.au_gate[2].weight)
-        nn.init.constant_(self.au_gate[2].bias, -1.5) # 从 -4.0 改为 -1.5 (Sigmoid约等于0.18)
-        
-        # Temperature 保持 5.0 锐化不变
-        self.temperature = nn.Parameter(torch.ones(1) * 5.0)
+        nn.init.constant_(self.au_gate[2].bias, -0.5)
+
+        # === Temperature（控制mask sharpness）===
+        self.temperature = nn.Parameter(torch.ones(1) * 0.5)
+
+        # === 可选：mask 正则缓存 ===
+        self.current_spatial_mask = None
 
     def __call__(
         self,
@@ -138,24 +141,22 @@ class AUAttnProcessor(nn.Module):
     ):
         residual = hidden_states
 
+        # ------------------- 0. 预处理 -------------------
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
 
         input_ndim = hidden_states.ndim
 
         if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+            B, C, H, W = hidden_states.shape
+            hidden_states = hidden_states.view(B, C, H * W).transpose(1, 2)
 
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        B, N, _ = hidden_states.shape
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        # ------------------- 1. 原版文本/图像特征的 Cross-Attention -------------------
+        # ------------------- 1. 原始 Cross-Attention（text/image） -------------------
         query = attn.to_q(hidden_states)
 
         if encoder_hidden_states is None:
@@ -170,57 +171,75 @@ class AUAttnProcessor(nn.Module):
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        attn_probs = attn.get_attention_scores(query, key, attention_mask)
+        base_hidden_states = torch.bmm(attn_probs, value)
+        base_hidden_states = attn.batch_to_head_dim(base_hidden_states)
 
-        # ------------------- 2. [修改] 显式路由与空间感知的 AU 融合 -------------------
-        # a. 将 AU Token 映射为键值对
-        # 动态获取当前 UNet 推理时的数据类型 (FP16 还是 FP32)
-        target_dtype = query.dtype 
-        
+        # ------------------- 2. ⭐ Spatial Routing（核心） -------------------
+
+        # === AU → K,V ===
+        target_dtype = query.dtype
         au_key = self.au_to_k(au_embedding)
         au_value = self.au_to_v(au_embedding)
 
         au_key = attn.head_to_batch_dim(au_key).to(target_dtype)
         au_value = attn.head_to_batch_dim(au_value).to(target_dtype)
 
-        # b. 计算锐化后的 Attention Scores (显式路由的核心)
-        # 强制将温度系数转化为 target_dtype，防止 float32 污染特征
-        scaled_alpha = attn.scale * self.temperature.to(target_dtype)
-        attention_scores = torch.bmm(query, au_key.transpose(-1, -2)) * scaled_alpha
-        
-        # Softmax 之后必须再次对齐类型，保证 au_attention_probs 是 Half
-        au_attention_probs = attention_scores.softmax(dim=-1).to(target_dtype)
+        # === Attention Score（Q × AU）===
+        # (B*H, HW, 12)
+        attention_scores = torch.bmm(query, au_key.transpose(-1, -2))
 
-        # c. [极其关键] 暴露当前层的 Spatial Mask，供外部 (如 wandb) 提取可视化
+        # 🔥 关键1：转成 AU → spatial
+        # (B*H, 12, HW)
+        attention_scores = attention_scores.transpose(1, 2)
+
+        # 🔥 关键2：temperature（正确用法）
+        attention_scores = attention_scores / self.temperature.clamp(min=1e-4)
+
+        # === Spatial Mask ===
+        au_attention_probs = attention_scores.softmax(dim=-1)  # over spatial
+
+        # ------------------- 3. 保存 mask（论文可视化） -------------------
         if not self.training or torch.rand(1).item() < 0.05:
-            head_dim = query.shape[0] // batch_size
-            mask_to_save = au_attention_probs.view(batch_size, head_dim, -1, au_attention_probs.shape[-1]).mean(dim=1)
-            attn.current_spatial_mask = mask_to_save.detach().cpu()
+            num_heads = query.shape[0] // B
+            mask = au_attention_probs.view(B, num_heads, -1, au_attention_probs.shape[-1])
+            mask = mask.mean(dim=1)  # (B, 12, HW)
+            self.current_spatial_mask = mask.detach().cpu()
 
-        # d. 提取特征 (这里就不会再报错了)
-        au_hidden_states = torch.bmm(au_attention_probs, au_value)
-        au_hidden_states = attn.batch_to_head_dim(au_hidden_states).to(target_dtype)
+        # ------------------- 4. AU Feature 提取 -------------------
 
-        # e. [融合核心] 空间感知特征调制 (Spatial Region-Aware Modulation)
-        # 为防止门控网络中的 Linear 层权重是 FP32，先临时转换维度输入，输出后再转回推理维度
+        # (B*H, 12, HW) × (B*H, 12, dim)
+        au_hidden_states = torch.bmm(
+            au_attention_probs.transpose(1, 2),  # (B*H, HW, 12)
+            au_value
+        )
+
+        au_hidden_states = attn.batch_to_head_dim(au_hidden_states)
+
+        # 🔥 防止 AU 太弱
+        au_hidden_states = au_hidden_states * 2.0
+
+        # ------------------- 5. Spatial Modulation（FiLM-like） -------------------
+
         gate_dtype = next(self.au_gate.parameters()).dtype
-        spatial_modulation_gate = torch.sigmoid(self.au_gate(au_hidden_states.to(gate_dtype))).to(target_dtype)
-        
-        modulated_au_states = spatial_modulation_gate * au_hidden_states
 
-        # 最终融合
-        hidden_states = hidden_states + au_scale * modulated_au_states
+        gate = torch.sigmoid(
+            self.au_gate(au_hidden_states.to(gate_dtype))
+        ).to(target_dtype)
 
-        # ------------------- 3. 扫尾工作 -------------------
-        # linear proj
+        # 🔥 residual-style modulation（更稳定）
+        modulated_au = gate * au_hidden_states
+
+        # ------------------- 6. 融合 -------------------
+
+        hidden_states = base_hidden_states + au_scale * modulated_au
+
+        # ------------------- 7. 输出 -------------------
         hidden_states = attn.to_out[0](hidden_states)
-        # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
         if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+            hidden_states = hidden_states.transpose(-1, -2).reshape(B, C, H, W)
 
         if attn.residual_connection:
             hidden_states = hidden_states + residual

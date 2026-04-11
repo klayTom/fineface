@@ -177,24 +177,38 @@ def log_validation(
             # ========================================================
             current_mask = None
             unwrapped_unet = accelerator.unwrap_model(unet)
-            for name, processor in unwrapped_unet.named_modules():
-                if hasattr(processor, 'current_spatial_mask') and processor.current_spatial_mask is not None:
-                    # 取出特征图 (seq_len, 12)
-                    mask_tensor = processor.current_spatial_mask[0] 
-                    seq_len = mask_tensor.shape[0]
-                    size = int(np.sqrt(seq_len))
+            # 遍历网络寻找挂载的 Mask
+            for name, module in pipeline.pipe.unet.named_modules():
+            if hasattr(module, 'current_spatial_mask') and getattr(module, 'current_spatial_mask') is not None:
+                mask_tensor = module.current_spatial_mask[0] 
+                
+                # 【修复 1：维度对齐】
+                # 因为新架构是 AU 找像素，挂载的维度是 (12, HW)，我们要把它转回 (HW, 12) 供画图使用
+                if mask_tensor.shape[0] == 12:
+                    mask_tensor = mask_tensor.transpose(0, 1)
                     
-                    # 寻找一个分辨率够大（至少 16x16 或 32x32）的 Attention 层来可视化
-                    if size * size == seq_len and size >= 16:
-                        # 把 12 个 AU 的激活区域叠加在一起，看整体的形变范围
-                        spatial_map = mask_tensor.max(dim=-1)[0].float().numpy()
-                        # 归一化到 0-255 以生成图片
-                        spatial_map = (spatial_map - spatial_map.min()) / (spatial_map.max() - spatial_map.min() + 1e-8)
-                        spatial_map = (spatial_map * 255).astype(np.uint8)
+                seq_len = mask_tensor.shape[0]
+                size = int(np.sqrt(seq_len))
+                
+                if size * size == seq_len and size >= 16:
+                    # 沿 AU 维度取最大值，看看像素点上最强的肌肉激活量
+                    spatial_map = mask_tensor.max(dim=-1)[0].float().cpu().numpy()
+                    
+                    # 【修复 2：规避均匀分布的纯黑 Bug】
+                    max_val = spatial_map.max()
+                    min_val = spatial_map.min()
+                    
+                    if max_val - min_val < 1e-6:
+                        # 如果是均匀的未激活状态，赋一个灰底色，证明观测仪是正常的
+                        spatial_map = np.ones_like(spatial_map) * 0.5 
+                    else:
+                        spatial_map = (spatial_map - min_val) / (max_val - min_val)
                         
-                        # 缩放到 512x512 方便和原图对比
-                        current_mask = Image.fromarray(spatial_map).resize((512, 512), resample=Image.NEAREST)
-                        break # 捞到一张足够清晰的 Mask 就退出当前循环
+                    spatial_map = spatial_map.reshape(size, size)
+                    spatial_map = (spatial_map * 255).astype(np.uint8)
+                    
+                    current_mask = Image.fromarray(spatial_map).resize((512, 512), resample=Image.NEAREST)
+                    break
             
             if current_mask is not None:
                 mask_images.append(current_mask)

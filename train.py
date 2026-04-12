@@ -44,14 +44,21 @@ import pandas as pd
 from copy import deepcopy
 from PIL import Image
 from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES=True
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from typing import Any, Dict, List, Optional
 import wandb
 import rarfile
 from datasets import concatenate_datasets
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    DiffusionPipeline,
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
+)
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr
 from diffusers.utils import check_min_version, is_wandb_available
@@ -71,6 +78,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 from PIL import Image
 
+
 class AUPipeline(StableDiffusionPipeline):
     def __init__(self, unet, vae, text_encoder, tokenizer, au_encoder, scheduler):
         self.unet = unet
@@ -79,44 +87,69 @@ class AUPipeline(StableDiffusionPipeline):
         self.tokenizer = tokenizer
         self.scheduler = scheduler
         self.au_encoder = au_encoder
-        
+
     @torch.no_grad()
     def get_text_embeddings(self, prompt):
         text_input = self.tokenizer(
-            prompt, padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt"
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
         )
         text_embeddings = self.text_encoder(text_input.input_ids.cuda())[0]
         return text_embeddings
 
     @torch.no_grad()
-    def __call__(self, prompt: str, aus: torch.tensor, num_inference_steps: int, guidance_scale: float = 7.5):
+    def __call__(
+        self,
+        prompt: str,
+        aus: torch.tensor,
+        num_inference_steps: int,
+        guidance_scale: float = 7.5,
+    ):
         bsz = 1
         latents = torch.randn(bsz, 4, 64, 64).float().cuda()
         aus = aus.float().cuda()
         au_embedding = self.au_encoder(aus)
         encoder_hidden_states = self.get_text_embeddings(prompt)
 
-        #CFG
+        # CFG
         negative_prompt = ""
         text_input = self.tokenizer(
-            [negative_prompt] * len(latents), padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt"
+            [negative_prompt] * len(latents),
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
         )
-        unconditional_text_embeddings = self.text_encoder(text_input.input_ids.cuda())[0]
+        unconditional_text_embeddings = self.text_encoder(text_input.input_ids.cuda())[
+            0
+        ]
         uncond_aus = torch.zeros_like(aus)
         unconditional_au_embedding = self.au_encoder(uncond_aus)
-        
-        encoder_hidden_states = torch.cat([encoder_hidden_states, unconditional_text_embeddings])
+
+        encoder_hidden_states = torch.cat(
+            [encoder_hidden_states, unconditional_text_embeddings]
+        )
         au_embedding = torch.cat([au_embedding, unconditional_au_embedding])
-                 
+
         self.scheduler.set_timesteps(num_inference_steps)
-        for i, t in tqdm(enumerate(self.scheduler.timesteps), total=len(self.scheduler.timesteps)):
+        for i, t in tqdm(
+            enumerate(self.scheduler.timesteps), total=len(self.scheduler.timesteps)
+        ):
             latentsm = torch.cat([latents] * 2)
             cross_attention_kwargs = {"au_embedding": au_embedding, "au_scale": 1.0}
-            noise_pred = self.unet.forward(latentsm, t, encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs).sample
+            noise_pred = self.unet.forward(
+                latentsm,
+                t,
+                encoder_hidden_states,
+                cross_attention_kwargs=cross_attention_kwargs,
+            ).sample
             cond_pred, uncond_pred = noise_pred.chunk(2)
             noise_pred = uncond_pred + guidance_scale * (cond_pred - uncond_pred)
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            
+
         latents = 1 / 0.18215 * latents
         x0 = self.vae.decode(latents.to(self.vae.dtype)).sample
         images = []
@@ -128,14 +161,154 @@ class AUPipeline(StableDiffusionPipeline):
         return images
 
 
+def extract_spatial_mask_from_unet(
+    unet,
+    min_size=16,
+    out_size=512,
+    topk_ratio=0.1,
+    return_info=False,
+):
+    """
+    自动从 UNet 所有带 current_spatial_mask 的模块中，
+    选择“最清晰”的一层 mask 并返回 PIL.Image。
+
+    支持 mask shape:
+      - (B, 12, HW)
+      - (B, HW, 12)
+      - (12, HW)
+      - (HW, 12)
+
+    评分依据：
+      1. dynamic range（动态范围）
+      2. sparsity（高响应区域是否集中）
+      3. resolution（分辨率奖励）
+
+    Args:
+        unet: diffusion UNet
+        min_size: 最小可接受 spatial size
+        out_size: 输出可视化大小
+        topk_ratio: 用于估计“高响应集中度”的 top-k 比例
+        return_info: 是否额外返回最佳层的信息
+
+    Returns:
+        current_mask (PIL.Image or None)
+        best_info (dict, optional)
+    """
+    best_score = -1e9
+    best_mask = None
+    best_info = None
+
+    for name, module in unet.named_modules():
+        if not hasattr(module, "current_spatial_mask"):
+            continue
+
+        mask_tensor = getattr(module, "current_spatial_mask", None)
+        if mask_tensor is None:
+            continue
+
+        if not isinstance(mask_tensor, torch.Tensor):
+            continue
+
+        mask_tensor = mask_tensor.detach().float().cpu()
+
+        # 支持 batch 维
+        if mask_tensor.ndim == 3:
+            mask_tensor = mask_tensor[0]
+
+        if mask_tensor.ndim != 2:
+            continue
+
+        # 统一转为 (HW, 12)
+        if mask_tensor.shape[0] == 12 and mask_tensor.shape[1] != 12:
+            mask_tensor = mask_tensor.transpose(0, 1)
+        elif mask_tensor.shape[1] == 12:
+            pass
+        else:
+            continue
+
+        seq_len = mask_tensor.shape[0]
+        size = int(np.sqrt(seq_len))
+
+        # 必须能还原成正方形特征图
+        if size * size != seq_len or size < min_size:
+            continue
+
+        # 聚合 12 个 AU：每个位置取最强响应
+        spatial_map = mask_tensor.max(dim=-1)[0].numpy()
+
+        max_val = float(spatial_map.max())
+        min_val = float(spatial_map.min())
+        dynamic_range = max_val - min_val
+
+        # 动态范围太小，直接跳过
+        if dynamic_range < 1e-6:
+            continue
+
+        # 归一化到 [0, 1]
+        norm_map = (spatial_map - min_val) / (dynamic_range + 1e-8)
+
+        flat = norm_map.reshape(-1)
+
+        # top-k 平均值：越大说明热点越集中
+        k = max(1, int(len(flat) * topk_ratio))
+        sorted_flat = np.sort(flat)
+        topk_mean = float(sorted_flat[-k:].mean())
+        global_mean = float(flat.mean()) + 1e-8
+        sparsity_score = topk_mean / global_mean
+
+        # 额外看一下标准差，防止整张图都均匀亮
+        contrast_score = float(flat.std())
+
+        # 分辨率奖励：偏向更高分辨率的层，但权重不要太大
+        resolution_score = float(np.log2(size))
+
+        # 综合评分
+        score = (
+            1.0 * dynamic_range
+            + 0.8 * sparsity_score
+            + 0.6 * contrast_score
+            + 0.3 * resolution_score
+        )
+
+        if score > best_score:
+            best_score = score
+
+            vis_map = (norm_map.reshape(size, size) * 255).astype(np.uint8)
+            best_mask = Image.fromarray(vis_map).resize(
+                (out_size, out_size), resample=Image.NEAREST
+            )
+
+            best_info = {
+                "layer_name": name,
+                "score": float(score),
+                "size": int(size),
+                "dynamic_range": float(dynamic_range),
+                "sparsity_score": float(sparsity_score),
+                "contrast_score": float(contrast_score),
+                "resolution_score": float(resolution_score),
+            }
+
+    if return_info:
+        return best_mask, best_info
+    return best_mask
+
+
 def log_validation(
-        vae, unet, text_encoder, tokenizer, au_encoder,
-        args, accelerator, weight_dtype, epoch
-    ):
-    logger.info("Running validation... ")
+    vae,
+    unet,
+    text_encoder,
+    tokenizer,
+    au_encoder,
+    args,
+    accelerator,
+    weight_dtype,
+    epoch,
+):
+    logger.info("Running validation...")
 
     scheduler = diffusers.DPMSolverMultistepScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler")
+        args.pretrained_model_name_or_path, subfolder="scheduler"
+    )
 
     pipeline = AUPipeline(
         accelerator.unwrap_model(unet),
@@ -143,85 +316,88 @@ def log_validation(
         accelerator.unwrap_model(text_encoder),
         accelerator.unwrap_model(tokenizer),
         accelerator.unwrap_model(au_encoder),
-        scheduler
+        scheduler,
     )
-    pipeline.set_progress_bar_config(disable=True)
+
+    # 你的 AUPipeline 不是标准 diffusers pipeline，这里做兼容判断
+    if hasattr(pipeline, "set_progress_bar_config"):
+        pipeline.set_progress_bar_config(disable=True)
 
     if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+        try:
+            pipeline.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
 
     prompt = "a closeup of barack obama"
     aus = [
-        torch.tensor([[0, 0, 4, 0, 0, 0,  0,  0,  0,  0,  0,  0]]),
-        torch.tensor([[4, 4, 0, 4, 0, 0,  0,  0,  0,  0,  4,  0]]),
-        torch.tensor([[3, 0, 0, 0, 4, 0,  4,  0,  0,  0,  3,  0]]),
-        torch.tensor([[0, 0, 0, -10, 0, 0,  0,  0,  0,  0,  0,  0]]),
+        torch.tensor([[0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0]]),
+        torch.tensor([[4, 4, 0, 4, 0, 0, 0, 0, 0, 0, 4, 0]]),
+        torch.tensor([[3, 0, 0, 0, 4, 0, 4, 0, 0, 0, 3, 0]]),
+        torch.tensor([[0, 0, 0, -10, 0, 0, 0, 0, 0, 0, 0, 0]]),
     ]
-    with torch.autocast("cuda"):
-        images = []
-        mask_images = [] # [新增] 用于存放提取出来的热力图
-        
-        for au in aus:
-            torch.manual_seed(4)
-            # 生成人脸图像
-            image = pipeline(prompt, au, num_inference_steps=200, guidance_scale=7.5)[0]
-            images.append(image)
 
-            # ========================================================
-            # [新增核心逻辑]: 去 UNet 里“打捞”刚刚算出来的 Spatial Mask
-            # ========================================================
-            current_mask = None
-            unwrapped_unet = accelerator.unwrap_model(unet)
-            # 遍历网络寻找挂载的 Mask
-            for name, module in pipeline.pipe.unet.named_modules():
-            if hasattr(module, 'current_spatial_mask') and getattr(module, 'current_spatial_mask') is not None:
-                mask_tensor = module.current_spatial_mask[0] 
-                
-                # 【修复 1：维度对齐】
-                # 因为新架构是 AU 找像素，挂载的维度是 (12, HW)，我们要把它转回 (HW, 12) 供画图使用
-                if mask_tensor.shape[0] == 12:
-                    mask_tensor = mask_tensor.transpose(0, 1)
-                    
-                seq_len = mask_tensor.shape[0]
-                size = int(np.sqrt(seq_len))
-                
-                if size * size == seq_len and size >= 16:
-                    # 沿 AU 维度取最大值，看看像素点上最强的肌肉激活量
-                    spatial_map = mask_tensor.max(dim=-1)[0].float().cpu().numpy()
-                    
-                    # 【修复 2：规避均匀分布的纯黑 Bug】
-                    max_val = spatial_map.max()
-                    min_val = spatial_map.min()
-                    
-                    if max_val - min_val < 1e-6:
-                        # 如果是均匀的未激活状态，赋一个灰底色，证明观测仪是正常的
-                        spatial_map = np.ones_like(spatial_map) * 0.5 
-                    else:
-                        spatial_map = (spatial_map - min_val) / (max_val - min_val)
-                        
-                    spatial_map = spatial_map.reshape(size, size)
-                    spatial_map = (spatial_map * 255).astype(np.uint8)
-                    
-                    current_mask = Image.fromarray(spatial_map).resize((512, 512), resample=Image.NEAREST)
-                    break
-            
-            if current_mask is not None:
-                mask_images.append(current_mask)
-            else:
-                # 极端情况下没抓到，给张全黑占位图防止崩溃
-                mask_images.append(Image.new("L", (512, 512), 0))
+    images = []
+    mask_images = []
+    mask_infos = []
+
+    # 显式切到 eval，保证 AUAttnProcessor 每次都记录 mask
+    pipeline.unet.eval()
+    pipeline.vae.eval()
+    pipeline.text_encoder.eval()
+    pipeline.au_encoder.eval()
+
+    with torch.no_grad():
+        with torch.autocast("cuda"):
+            for au in aus:
+                torch.manual_seed(4)
+
+                image = pipeline(
+                    prompt,
+                    au,
+                    num_inference_steps=200,
+                    guidance_scale=7.5,
+                )[0]
+                images.append(image)
+
+                # 训练验证阶段：AUPipeline 只有 self.unet，没有 self.pipe
+                current_mask, mask_info = extract_spatial_mask_from_unet(
+                    pipeline.unet,
+                    min_size=16,
+                    out_size=512,
+                    topk_ratio=0.1,
+                    return_info=True,
+                )
+
+                if current_mask is not None:
+                    mask_images.append(current_mask)
+                else:
+                    mask_images.append(Image.new("L", (512, 512), 0))
+                    mask_info = {
+                        "layer_name": "none",
+                        "score": -1.0,
+                        "size": -1,
+                        "dynamic_range": 0.0,
+                        "sparsity_score": 0.0,
+                        "contrast_score": 0.0,
+                        "resolution_score": 0.0,
+                    }
+
+                mask_infos.append(mask_info)
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-        if tracker.name == "wandb":
-            # [修改]: 将人脸图和 Mask 图分离上传到 WandB 的不同面板
+            tracker.writer.add_images(
+                "validation", np_images, epoch, dataformats="NHWC"
+            )
+
+            np_masks = np.stack([np.asarray(img) for img in mask_images])
+            tracker.writer.add_images(
+                "validation_masks", np_masks, epoch, dataformats="NHWC"
+            )
+
+        elif tracker.name == "wandb":
             tracker.log(
                 {
                     "test_images": [
@@ -229,18 +405,27 @@ def log_validation(
                         for i, image in enumerate(images)
                     ],
                     "test_masks": [
-                        wandb.Image(mask, caption=f"Mask {i}: {str(aus[i].round())}")
+                        wandb.Image(
+                            mask,
+                            caption=(
+                                f"Mask {i}: {str(aus[i].round())} | "
+                                f"layer={mask_infos[i]['layer_name']} | "
+                                f"score={mask_infos[i]['score']:.3f} | "
+                                f"size={mask_infos[i]['size']}"
+                            ),
+                        )
                         for i, mask in enumerate(mask_images)
-                    ]
+                    ],
                 }
             )
         else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            logger.warning(f"image logging not implemented for {tracker.name}")
 
     del pipeline
     torch.cuda.empty_cache()
 
     return images
+
 
 def tokenize_prompt(tokenizer, prompt):
     text_inputs = tokenizer(
@@ -252,6 +437,7 @@ def tokenize_prompt(tokenizer, prompt):
     )
     text_input_ids = text_inputs.input_ids
     return text_input_ids
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -302,7 +488,10 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+        "--image_column",
+        type=str,
+        default="image",
+        help="The column of the dataset containing an image.",
     )
     parser.add_argument(
         "--caption_column",
@@ -311,7 +500,10 @@ def parse_args():
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
+        "--validation_prompt",
+        type=str,
+        default=None,
+        help="A prompt that is sampled during training for inference.",
     )
     parser.add_argument(
         "--num_validation_images",
@@ -349,7 +541,9 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument(
+        "--seed", type=int, default=None, help="A seed for reproducible training."
+    )
     parser.add_argument(
         "--resolution",
         type=int,
@@ -374,7 +568,10 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size",
+        type=int,
+        default=16,
+        help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -416,7 +613,10 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps",
+        type=int,
+        default=500,
+        help="Number of steps for the warmup in the lr scheduler.",
     )
     parser.add_argument(
         "--snr_gamma",
@@ -426,7 +626,9 @@ def parse_args():
         "More details here: https://arxiv.org/abs/2303.09556.",
     )
     parser.add_argument(
-        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+        "--use_8bit_adam",
+        action="store_true",
+        help="Whether or not to use 8-bit Adam from bitsandbytes.",
     )
     parser.add_argument(
         "--allow_tf32",
@@ -444,13 +646,41 @@ def parse_args():
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
     )
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--adam_beta1",
+        type=float,
+        default=0.9,
+        help="The beta1 parameter for the Adam optimizer.",
+    )
+    parser.add_argument(
+        "--adam_beta2",
+        type=float,
+        default=0.999,
+        help="The beta2 parameter for the Adam optimizer.",
+    )
+    parser.add_argument(
+        "--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use."
+    )
+    parser.add_argument(
+        "--adam_epsilon",
+        type=float,
+        default=1e-08,
+        help="Epsilon value for the Adam optimizer",
+    )
+    parser.add_argument(
+        "--max_grad_norm", default=1.0, type=float, help="Max gradient norm."
+    )
+    parser.add_argument(
+        "--push_to_hub",
+        action="store_true",
+        help="Whether or not to push the model to the Hub.",
+    )
+    parser.add_argument(
+        "--hub_token",
+        type=str,
+        default=None,
+        help="The token to use to push to the Model Hub.",
+    )
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -492,7 +722,12 @@ def parse_args():
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="For distributed training: local_rank",
+    )
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -518,9 +753,13 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+        "--enable_xformers_memory_efficient_attention",
+        action="store_true",
+        help="Whether or not to use xformers.",
     )
-    parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
+    parser.add_argument(
+        "--noise_offset", type=float, default=0, help="The scale of noise offset."
+    )
     parser.add_argument(
         "--validation_steps",
         type=int,
@@ -576,12 +815,13 @@ def parse_args():
     return args
 
 
-
 def main():
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    accelerator_project_config = ProjectConfiguration(
+        project_dir=args.output_dir, logging_dir=logging_dir
+    )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -591,7 +831,9 @@ def main():
     )
     if args.report_to == "wandb":
         if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+            raise ImportError(
+                "Make sure to install wandb if you want to use it for logging during training."
+            )
         import wandb
 
     # Make one log on every process with the configuration for debugging.
@@ -621,28 +863,46 @@ def main():
 
         if args.push_to_hub:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=args.hub_model_id or Path(args.output_dir).name,
+                exist_ok=True,
+                token=args.hub_token,
             ).repo_id
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler"
+    )
     tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer",
+        revision=args.revision,
     )
     text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        args.pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=args.revision,
     )
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path,
+        subfolder="vae",
+        revision=args.revision,
+        variant=args.variant,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=args.revision,
+        variant=args.variant,
     )
 
     unet.set_default_attn_processor()
     hack_unet_attn_layers(unet, AUAttnProcessor)
 
     # Init au_adapter weights with copies of cross-attention
-    attn2_modules = [module for name, module in unet.named_modules() if "attn2" in name and "attn2." not in name]
+    attn2_modules = [
+        module
+        for name, module in unet.named_modules()
+        if "attn2" in name and "attn2." not in name
+    ]
     for attn_module in attn2_modules:
         attn_module.processor.au_to_k = deepcopy(attn_module.to_k)
         attn_module.processor.au_to_v = deepcopy(attn_module.to_v)
@@ -664,7 +924,9 @@ def main():
         param.requires_grad_(False)
 
     unet_lora_config = LoraConfig(
-       r=args.rank, init_lora_weights="gaussian", target_modules=["to_k", "to_q", "to_v", "to_out.0"]
+        r=args.rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
 
     # Move unet, vae and text_encoder to device and cast to weight_dtype
@@ -675,7 +937,7 @@ def main():
     # ... (接在 text_encoder.to(accelerator.device) 之后) ...
 
     logger.info("Loading ArcFace model for Identity Preservation...")
-    arcface = InceptionResnetV1(pretrained='vggface2').eval().to(accelerator.device)
+    arcface = InceptionResnetV1(pretrained="vggface2").eval().to(accelerator.device)
     for param in arcface.parameters():
         param.requires_grad = False
 
@@ -683,21 +945,41 @@ def main():
     logger.info("Extracting Exact Text Anchors for AU Alignment...")
     # 严格按照你数据集里 12 个 AU 的物理含义定义锚点
     AU_TEXT_PROMPTS = [
-        "inner brow raiser", "outer brow raiser", "brow lowerer", 
-        "upper lid raiser", "cheek raiser", "nose wrinkler", 
-        "lip corner puller", "lip corner depressor", "chin raiser", 
-        "lip stretcher", "lips part", "jaw drop"
+        "inner brow raiser",
+        "outer brow raiser",
+        "brow lowerer",
+        "upper lid raiser",
+        "cheek raiser",
+        "nose wrinkler",
+        "lip corner puller",
+        "lip corner depressor",
+        "chin raiser",
+        "lip stretcher",
+        "lips part",
+        "jaw drop",
     ]
-    anchor_inputs = tokenizer(AU_TEXT_PROMPTS, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    anchor_inputs = tokenizer(
+        AU_TEXT_PROMPTS,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
     with torch.no_grad():
-        au_text_anchors = text_encoder(anchor_inputs.input_ids.to(accelerator.device))[0]
+        au_text_anchors = text_encoder(anchor_inputs.input_ids.to(accelerator.device))[
+            0
+        ]
         # 对 77 个 Token 做均值池化，得到 12 个纯净的语义向量
-        au_text_anchors = au_text_anchors.mean(dim=1) # 形状: (12, 1024)
+        au_text_anchors = au_text_anchors.mean(dim=1)  # 形状: (12, 1024)
     #
 
     # Add adapter and make sure the trainable params are in float32.
     unet.add_adapter(unet_lora_config, adapter_name="unet")
-    [attn_module.requires_grad_(True) for attn_module in unet.attn_processors.values() if isinstance(attn_module, AUAttnProcessor)]
+    [
+        attn_module.requires_grad_(True)
+        for attn_module in unet.attn_processors.values()
+        if isinstance(attn_module, AUAttnProcessor)
+    ]
     if args.mixed_precision == "fp16":
         for param in unet.parameters():
             # only upcast trainable parameters (LoRA) into fp32
@@ -715,14 +997,18 @@ def main():
                 )
             unet.enable_xformers_memory_efficient_attention()
         else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
-        
+            raise ValueError(
+                "xformers is not available. Make sure it is installed correctly"
+            )
+
     au_encoder = AUEncoder().cuda().requires_grad_(True)
     au_encoder.train()
-    
+
     from itertools import chain
 
-    lora_layers = filter(lambda p: p.requires_grad, chain(unet.parameters(), au_encoder.parameters()))
+    lora_layers = filter(
+        lambda p: p.requires_grad, chain(unet.parameters(), au_encoder.parameters())
+    )
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -731,7 +1017,10 @@ def main():
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+            args.learning_rate
+            * args.gradient_accumulation_steps
+            * args.train_batch_size
+            * accelerator.num_processes
         )
 
     # Initialize the optimizer
@@ -755,7 +1044,9 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    disfa_dataset = load_disfa(args.disfa_image_path, args.disfa_label_path, args.disfa_captions_file)
+    disfa_dataset = load_disfa(
+        args.disfa_image_path, args.disfa_label_path, args.disfa_captions_file
+    )
 
     an_dataset = load_affectnet(args.affectnet_rar_file, args.affectnet_csv_path)
 
@@ -765,11 +1056,12 @@ def main():
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            train_dataset = train_dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
+            train_dataset = train_dataset.shuffle(seed=args.seed).select(
+                range(args.max_train_samples)
+            )
         # Set the training transforms
-        #train_dataset = train_dataset.with_transform(preprocess_train)
+        # train_dataset = train_dataset.with_transform(preprocess_train)
 
-    
     def collate_fn(examples):
         # Images to pixels
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -777,8 +1069,15 @@ def main():
         # Get AUs
         aus = torch.stack([example["aus"] for example in examples])
         caption = [example["caption"] for example in examples]
-        tokens = torch.stack([tokenize_prompt(tokenizer, example["caption"]) for example in examples])
-        return {"pixel_values": pixel_values, "aus": aus, "caption": caption, "tokens": tokens}
+        tokens = torch.stack(
+            [tokenize_prompt(tokenizer, example["caption"]) for example in examples]
+        )
+        return {
+            "pixel_values": pixel_values,
+            "aus": aus,
+            "caption": caption,
+            "tokens": tokens,
+        }
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -791,7 +1090,9 @@ def main():
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -809,7 +1110,9 @@ def main():
     )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -821,13 +1124,19 @@ def main():
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
 
     # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = (
+        args.train_batch_size
+        * accelerator.num_processes
+        * args.gradient_accumulation_steps
+    )
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
@@ -874,7 +1183,9 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet, au_encoder):
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(
+                    batch["pixel_values"].to(dtype=weight_dtype)
+                ).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -882,12 +1193,18 @@ def main():
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                        (latents.shape[0], latents.shape[1], 1, 1),
+                        device=latents.device,
                     )
 
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(
+                    0,
+                    noise_scheduler.config.num_train_timesteps,
+                    (bsz,),
+                    device=latents.device,
+                )
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -907,73 +1224,118 @@ def main():
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
                     # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                    noise_scheduler.register_to_config(
+                        prediction_type=args.prediction_type
+                    )
 
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    raise ValueError(
+                        f"Unknown prediction type {noise_scheduler.config.prediction_type}"
+                    )
 
                 # Predict the noise residual and compute loss
                 # ----------------- 替换从这里开始 -----------------
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs).sample
+                model_pred = unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                ).sample
 
                 # [1] 原始去噪 MSE Loss (重建基础)
                 if args.snr_gamma is None:
-                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    mse_loss = F.mse_loss(
+                        model_pred.float(), target.float(), reduction="mean"
+                    )
                 else:
                     snr = compute_snr(noise_scheduler, timesteps)
                     if noise_scheduler.config.prediction_type == "v_prediction":
                         snr = snr + 1
-                    mse_loss_weights = (torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr)
-                    loss_temp = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss_temp = loss_temp.mean(dim=list(range(1, len(loss_temp.shape)))) * mse_loss_weights
+                    mse_loss_weights = (
+                        torch.stack(
+                            [snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1
+                        ).min(dim=1)[0]
+                        / snr
+                    )
+                    loss_temp = F.mse_loss(
+                        model_pred.float(), target.float(), reduction="none"
+                    )
+                    loss_temp = (
+                        loss_temp.mean(dim=list(range(1, len(loss_temp.shape))))
+                        * mse_loss_weights
+                    )
                     mse_loss = loss_temp.mean()
 
                 # [2] ArcFace 身份保持 Loss (保脸)
-                sample_num = 1 # 极度关键：VAE 梯度极耗显存，每个批次只挑1张算 ID Loss 护盘！
-                alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps].to(latents.device).float()
+                sample_num = (
+                    1  # 极度关键：VAE 梯度极耗显存，每个批次只挑1张算 ID Loss 护盘！
+                )
+                alpha_prod_t = (
+                    noise_scheduler.alphas_cumprod[timesteps].to(latents.device).float()
+                )
                 beta_prod_t = 1.0 - alpha_prod_t
                 alpha_prod_t = torch.clamp(alpha_prod_t, min=1e-5).view(-1, 1, 1, 1)
                 beta_prod_t = beta_prod_t.view(-1, 1, 1, 1)
-                
-                pred_x0_latent = (noisy_latents.float() - beta_prod_t ** (0.5) * model_pred.float()) / alpha_prod_t ** (0.5)
+
+                pred_x0_latent = (
+                    noisy_latents.float() - beta_prod_t ** (0.5) * model_pred.float()
+                ) / alpha_prod_t ** (0.5)
                 pred_x0_latent = torch.clamp(pred_x0_latent, min=-10.0, max=10.0)
 
                 with torch.autocast("cuda", enabled=False):
-                    pred_x0_image = vae.decode(pred_x0_latent[:sample_num].to(weight_dtype) / vae.config.scaling_factor).sample
-                    pred_x0_image = torch.clamp(pred_x0_image.float(), min=-1.0, max=1.0) 
+                    pred_x0_image = vae.decode(
+                        pred_x0_latent[:sample_num].to(weight_dtype)
+                        / vae.config.scaling_factor
+                    ).sample
+                    pred_x0_image = torch.clamp(
+                        pred_x0_image.float(), min=-1.0, max=1.0
+                    )
 
                     gt_image = batch["pixel_values"][:sample_num].float()
 
-                    pred_face = F.interpolate(pred_x0_image, size=(160, 160), mode='area').contiguous()
-                    gt_face = F.interpolate(gt_image, size=(160, 160), mode='area').contiguous()
+                    pred_face = F.interpolate(
+                        pred_x0_image, size=(160, 160), mode="area"
+                    ).contiguous()
+                    gt_face = F.interpolate(
+                        gt_image, size=(160, 160), mode="area"
+                    ).contiguous()
 
                     pred_id = arcface(pred_face)
                     gt_id = arcface(gt_face)
-                    
+
                     id_loss = 1.0 - F.cosine_similarity(pred_id, gt_id).mean()
                     id_loss = torch.nan_to_num(id_loss, nan=0.0)
 
                 # [3] 创新点：纯净 Text-AU 精准对齐 Loss (彻底解耦)
                 # au_embedding 形状: (Batch, 12, 1024)
                 # au_text_anchors 形状: (12, 1024) -> 广播后计算相似度
-                sim = F.cosine_similarity(au_embedding, au_text_anchors.unsqueeze(0), dim=-1) # (Batch, 12)
-                
+                sim = F.cosine_similarity(
+                    au_embedding, au_text_anchors.unsqueeze(0), dim=-1
+                )  # (Batch, 12)
+
                 # 【核心逻辑】：只对当前活跃的肌肉做对齐惩罚！没动的肌肉不去强行对齐。
                 # aus 包含了每个 AU 的强度 [0, 5]，归一化后作为对齐权重。
-                intensity_weights = aus / 5.0 
+                intensity_weights = aus / 5.0
                 align_loss = ((1.0 - sim) * intensity_weights).mean()
 
                 # 总损失聚合
-                lambda_id = 0.15      # 身份护城河权重
-                lambda_align = 0.05   # 解耦权重
+                lambda_id = 0.15  # 身份护城河权重
+                lambda_align = 0.05  # 解耦权重
                 loss = mse_loss + lambda_id * id_loss + lambda_align * align_loss
 
                 # (可选) 推送 WandB 用于监控分离的 Loss
-                accelerator.log({"loss_mse": mse_loss.item(), "loss_id": id_loss.item(), "loss_align": align_loss.item()}, step=global_step)
+                accelerator.log(
+                    {
+                        "loss_mse": mse_loss.item(),
+                        "loss_id": id_loss.item(),
+                        "loss_align": align_loss.item(),
+                    },
+                    step=global_step,
+                )
                 # ----------------- 替换到此结束 -----------------
 
                 # Gather the losses across all processes for logging (if we use distributed training).
@@ -1001,38 +1363,64 @@ def main():
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                            checkpoints = [
+                                d for d in checkpoints if d.startswith("checkpoint")
+                            ]
+                            checkpoints = sorted(
+                                checkpoints, key=lambda x: int(x.split("-")[1])
+                            )
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                num_to_remove = (
+                                    len(checkpoints) - args.checkpoints_total_limit + 1
+                                )
                                 removing_checkpoints = checkpoints[0:num_to_remove]
 
                                 logger.info(
                                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                logger.info(
+                                    f"removing checkpoints: {', '.join(removing_checkpoints)}"
+                                )
 
                                 for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    removing_checkpoint = os.path.join(
+                                        args.output_dir, removing_checkpoint
+                                    )
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(
+                            args.output_dir, f"checkpoint-{global_step}"
+                        )
                         accelerator.save_state(save_path)
 
                         unwrapped_unet = accelerator.unwrap_model(unet)
-                        filtered_sd = {name: module for name, module in unwrapped_unet.state_dict().items() if "attn2.processor" in name}
+                        filtered_sd = {
+                            name: module
+                            for name, module in unwrapped_unet.state_dict().items()
+                            if "attn2.processor" in name
+                        }
                         torch.save(filtered_sd, save_path + "/attn_processors.ckpt")
-                        peft_state_dict = get_peft_model_state_dict(unwrapped_unet, adapter_name="unet")
-                        StableDiffusionPipeline.save_lora_weights(save_directory=save_path, unet_lora_layers=peft_state_dict)
+                        peft_state_dict = get_peft_model_state_dict(
+                            unwrapped_unet, adapter_name="unet"
+                        )
+                        StableDiffusionPipeline.save_lora_weights(
+                            save_directory=save_path, unet_lora_layers=peft_state_dict
+                        )
 
                         unwrapped_encoder = accelerator.unwrap_model(au_encoder)
-                        torch.save(unwrapped_encoder.state_dict(), save_path + "/au_encoder.ckpt")
+                        torch.save(
+                            unwrapped_encoder.state_dict(),
+                            save_path + "/au_encoder.ckpt",
+                        )
 
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "step_loss": loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -1059,14 +1447,19 @@ def main():
         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
 
         unwrapped_unet = accelerator.unwrap_model(unet)
-        filtered_sd = {name: module for name, module in unwrapped_unet.state_dict().items() if "attn2.processor" in name}
+        filtered_sd = {
+            name: module
+            for name, module in unwrapped_unet.state_dict().items()
+            if "attn2.processor" in name
+        }
         torch.save(filtered_sd, save_path + "/attn_processors.ckpt")
         peft_state_dict = get_peft_model_state_dict(unwrapped_unet, adapter_name="unet")
-        StableDiffusionPipeline.save_lora_weights(save_directory=save_path, unet_lora_layers=peft_state_dict)
-        
+        StableDiffusionPipeline.save_lora_weights(
+            save_directory=save_path, unet_lora_layers=peft_state_dict
+        )
+
         unwrapped_encoder = accelerator.unwrap_model(au_encoder)
         torch.save(unwrapped_encoder.state_dict(), save_path + "/au_encoder.ckpt")
-
 
     accelerator.end_training()
 

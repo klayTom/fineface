@@ -105,29 +105,20 @@ class AttnProcessor(nn.Module):
 class AUAttnProcessor(nn.Module):
     def __init__(self, hidden_size, cross_attention_dim=None):
         super().__init__()
-
-        self.hidden_size = hidden_size
-
-        # === AU → K,V 投影 ===
         self.au_to_k = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
         self.au_to_v = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
 
-        # === Spatial Modulation Gate（FiLM-like） ===
-        self.au_gate = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_size // 2, hidden_size)
-        )
+        # =========================================================================
+        # [创新点 1]: 空锚点吸收器 (The Null-Token Absorber)
+        # 初始化一个长度相同的随机 Token，供背景像素“倾泻”它们被迫分配的注意力
+        # =========================================================================
+        self.null_token = nn.Parameter(torch.randn(1, 1, cross_attention_dim or hidden_size) * 0.02)
 
-        # 🔥 更合理初始化（不会一开始全关）
-        nn.init.zeros_(self.au_gate[2].weight)
-        nn.init.constant_(self.au_gate[2].bias, -0.5)
-
-        # === Temperature（控制mask sharpness）===
-        self.temperature = nn.Parameter(torch.ones(1) * 0.5)
-
-        # === 可选：mask 正则缓存 ===
-        self.current_spatial_mask = None
+        # =========================================================================
+        # [创新点 2]: 零初始化的通道级动态门控 (Zero-Init Channel Gating)
+        # 保护底层先验，实现精细的通道筛选
+        # =========================================================================
+        self.gamma = nn.Parameter(torch.zeros(hidden_size))
 
     def __call__(
         self,
@@ -141,24 +132,24 @@ class AUAttnProcessor(nn.Module):
     ):
         residual = hidden_states
 
-        # ------------------- 0. 预处理 -------------------
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
 
         input_ndim = hidden_states.ndim
-
         if input_ndim == 4:
-            B, C, H, W = hidden_states.shape
-            hidden_states = hidden_states.view(B, C, H * W).transpose(1, 2)
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
 
-        B, N, _ = hidden_states.shape
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        # ------------------- 1. 原始 Cross-Attention（text/image） -------------------
+        # ------------------- 1. 原生文本交叉注意力 -------------------
         query = attn.to_q(hidden_states)
-
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
@@ -171,81 +162,62 @@ class AUAttnProcessor(nn.Module):
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
-        attn_probs = attn.get_attention_scores(query, key, attention_mask)
-        base_hidden_states = torch.bmm(attn_probs, value)
-        base_hidden_states = attn.batch_to_head_dim(base_hidden_states)
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
 
-        # ------------------- 2. ⭐ Spatial Routing（核心） -------------------
-
-        # === AU → K,V ===
+        # ------------------- 2. AU 融合：空锚点吸收与通道门控 -------------------
         target_dtype = query.dtype
-        au_key = self.au_to_k(au_embedding)
-        au_value = self.au_to_v(au_embedding)
+        
+        # a. 拼接第 13 个 Null-Token
+        expanded_null = self.null_token.expand(batch_size, -1, -1).to(target_dtype)
+        # extended_au_embedding shape: (Batch, 13, 1024)
+        extended_au_embedding = torch.cat([au_embedding, expanded_null], dim=1)
+
+        # b. 映射到 Key 和 Value
+        au_key = self.au_to_k(extended_au_embedding)
+        au_value = self.au_to_v(extended_au_embedding)
+        
+        # c. 【极其关键的物理切断】：强行让第 13 个 Token 的 Value 变成全 0 向量！
+        # 这样背景区域即便把 99% 的注意力分给了它，最后乘出来提取到的特征也只是纯净的 0。
+        au_value[:, -1, :] = 0.0
 
         au_key = attn.head_to_batch_dim(au_key).to(target_dtype)
         au_value = attn.head_to_batch_dim(au_value).to(target_dtype)
 
-        # === Attention Score（Q × AU）===
-        # (B*H, HW, 12)
-        attention_scores = torch.bmm(query, au_key.transpose(-1, -2))
+        # d. 计算注意力分数
+        attention_scores = torch.bmm(query, au_key.transpose(-1, -2)) * attn.scale
+        au_attention_probs = attention_scores.softmax(dim=-1).to(target_dtype)
 
-        # 🔥 关键1：转成 AU → spatial
-        # (B*H, 12, HW)
-        attention_scores = attention_scores.transpose(1, 2)
-
-        # 🔥 关键2：temperature（正确用法）
-        attention_scores = attention_scores / self.temperature.clamp(min=1e-4)
-
-        # === Spatial Mask ===
-        au_attention_probs = attention_scores.softmax(dim=-1)  # over spatial
-
-        # ------------------- 3. 保存 mask（论文可视化） -------------------
+        # e. 【新增】：剥离提取用于可视化的两种 Mask
         if not self.training or torch.rand(1).item() < 0.05:
-            num_heads = query.shape[0] // B
-            mask = au_attention_probs.view(B, num_heads, -1, au_attention_probs.shape[-1])
-            mask = mask.mean(dim=1)  # (B, 12, HW)
-            self.current_spatial_mask = mask.detach().cpu()
+            head_dim_count = query.shape[0] // batch_size
+            avg_probs = au_attention_probs.view(batch_size, head_dim_count, -1, 13).mean(dim=1) # (B, seq_len, 13)
+            
+            # 真实 AU 面部形变区 (前 12 个 Token 概率之和)
+            attn.current_spatial_mask = avg_probs[..., :12].sum(dim=-1).detach().cpu()
+            # 隔离吸收区 (第 13 个 Null-Token 的概率)
+            attn.current_null_mask = avg_probs[..., 12].detach().cpu()
 
-        # ------------------- 4. AU Feature 提取 -------------------
+        # f. 提取 AU 特征
+        au_hidden_states = torch.bmm(au_attention_probs, au_value)
+        au_hidden_states = attn.batch_to_head_dim(au_hidden_states).to(target_dtype)
 
-        # (B*H, 12, HW) × (B*H, 12, dim)
-        au_hidden_states = torch.bmm(
-            au_attention_probs.transpose(1, 2),  # (B*H, HW, 12)
-            au_value
-        )
+        # g. 【新增】：Zero-Init 通道级动态门控融合
+        modulated_au_states = self.gamma.to(target_dtype) * au_hidden_states
+        hidden_states = hidden_states + (au_scale * modulated_au_states)
 
-        au_hidden_states = attn.batch_to_head_dim(au_hidden_states)
-
-        # 🔥 防止 AU 太弱
-        au_hidden_states = au_hidden_states * 2.0
-
-        # ------------------- 5. Spatial Modulation（FiLM-like） -------------------
-
-        gate_dtype = next(self.au_gate.parameters()).dtype
-
-        gate = torch.sigmoid(
-            self.au_gate(au_hidden_states.to(gate_dtype))
-        ).to(target_dtype)
-
-        # 🔥 residual-style modulation（更稳定）
-        modulated_au = gate * au_hidden_states
-
-        # ------------------- 6. 融合 -------------------
-
-        hidden_states = base_hidden_states + au_scale * modulated_au
-
-        # ------------------- 7. 输出 -------------------
+        # ------------------- 3. 扫尾工作 -------------------
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
 
         if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(B, C, H, W)
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
         if attn.residual_connection:
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
-
         return hidden_states
 
 
